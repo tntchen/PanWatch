@@ -1089,6 +1089,55 @@ export default function AgentsPage() {
               </div>
             </section>
 
+            {/* 联动触发(intraday 急涨/急跌) */}
+            {(() => {
+              const autoTrigger = (taConfigForm.auto_trigger as Record<string, unknown>) || {}
+              const setAuto = (patch: Record<string, unknown>) =>
+                setTaConfigForm({ ...taConfigForm, auto_trigger: { ...autoTrigger, ...patch } })
+              return (
+                <section>
+                  <div className="flex items-center gap-2 mb-2">
+                    <input
+                      type="checkbox"
+                      id="auto-trigger-enabled"
+                      checked={!!autoTrigger.enabled}
+                      onChange={e => setAuto({ enabled: e.target.checked })}
+                    />
+                    <label htmlFor="auto-trigger-enabled" className="font-medium cursor-pointer">
+                      盘中急涨/急跌自动触发深度分析
+                    </label>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3 mb-2">
+                    <div>
+                      <Label className="text-[12px]">涨跌幅阈值(%)</Label>
+                      <Input
+                        type="number"
+                        step="0.5"
+                        min={1}
+                        max={20}
+                        value={String(autoTrigger.change_pct_threshold ?? 5)}
+                        onChange={e => setAuto({ change_pct_threshold: parseFloat(e.target.value) || 5 })}
+                      />
+                    </div>
+                    <div>
+                      <Label className="text-[12px]">冷却时间(小时)</Label>
+                      <Input
+                        type="number"
+                        min={1}
+                        max={168}
+                        value={String(autoTrigger.cooldown_hours ?? 24)}
+                        onChange={e => setAuto({ cooldown_hours: parseInt(e.target.value) || 24 })}
+                      />
+                    </div>
+                  </div>
+                  <div className="text-[11px] text-muted-foreground">
+                    启用后,intraday_monitor 分析时若发现 |涨跌幅| ≥ 阈值,自动 fire-and-forget 触发 TA 深度分析。
+                    冷却时间内同一标的不会重复触发;月度预算用尽也会停止。<strong>默认关闭</strong> 避免成本失控。
+                  </div>
+                </section>
+              )
+            })()}
+
             {/* 高级 JSON */}
             <details className="text-[12px]">
               <summary className="cursor-pointer text-muted-foreground hover:text-foreground">

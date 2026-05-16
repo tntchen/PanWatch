@@ -806,6 +806,13 @@ class IntradayMonitorAgent(BaseAgent):
         if context.model_label:
             content = content.rstrip() + f"\n\n---\nAI: {context.model_label}"
 
+        # 急涨/急跌联动:满足阈值时异步触发 TradingAgents 深度分析(默认关闭)
+        try:
+            from src.agents.tradingagents.auto_trigger import try_auto_trigger
+            try_auto_trigger(stock, source_agent=self.name)
+        except Exception:
+            logger.exception("TA 联动触发失败,继续返回 intraday 结果")
+
         return AnalysisResult(
             agent_name=self.name,
             title=title,
