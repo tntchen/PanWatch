@@ -1,12 +1,11 @@
 import { useState, useEffect, useRef } from 'react'
 import { Routes, Route, NavLink, useLocation, Navigate } from 'react-router-dom'
-import { Moon, Sun, TrendingUp, Bot, ScrollText, Settings, List, Database, Clock, LayoutDashboard, LogOut, Github, BellRing, MoreHorizontal, Sparkles, Activity, PieChart } from 'lucide-react'
+import { Moon, Sun, TrendingUp, Bot, ScrollText, Settings, List, Database, Clock, LayoutDashboard, LogOut, Github, BellRing, MoreHorizontal, Sparkles, Activity } from 'lucide-react'
 import { useTheme } from '@/hooks/use-theme'
 import { appApi, fetchAPI, isAuthenticated, logout } from '@panwatch/api'
 import DashboardPage from '@/pages/Dashboard'
 import OpportunitiesPage from '@/pages/Opportunities'
 import StocksPage from '@/pages/Stocks'
-import PortfolioPage from '@/pages/Portfolio'
 import AgentsPage from '@/pages/Agents'
 import SettingsPage from '@/pages/Settings'
 import DataSourcesPage from '@/pages/DataSources'
@@ -24,7 +23,6 @@ import { Button } from '@panwatch/base-ui/components/ui/button'
 const navItems = [
   { to: '/', icon: LayoutDashboard, label: '首页' },
   { to: '/portfolio', icon: List, label: '持仓' },
-  { to: '/composition', icon: PieChart, label: '组合' },
   { to: '/opportunities', icon: Sparkles, label: '机会' },
   { to: '/alerts', icon: BellRing, label: '提醒' },
   { to: '/paper-trading', icon: Activity, label: '模拟盘' },
@@ -354,7 +352,6 @@ function App() {
           <Route path="/" element={<DashboardPage />} />
           <Route path="/opportunities" element={<OpportunitiesPage />} />
           <Route path="/portfolio" element={<StocksPage />} />
-          <Route path="/composition" element={<PortfolioPage />} />
           <Route path="/agents" element={<AgentsPage />} />
           <Route path="/history" element={<HistoryPage />} />
           <Route path="/paper-trading" element={<PaperTradingPage />} />
