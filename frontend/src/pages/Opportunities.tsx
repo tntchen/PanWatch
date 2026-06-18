@@ -738,6 +738,14 @@ export default function OpportunitiesPage() {
                     <div className={`text-[12px] font-mono mt-1 ${Number(item.rank_score || item.score || 0) >= 80 ? 'text-primary' : 'text-muted-foreground'}`}>
                       评分 {Math.round(item.rank_score || item.score || 0)}
                     </div>
+                    {item.ai_score != null && (
+                      <div className="mt-1 flex items-center justify-end gap-1">
+                        <span className="text-[10px] text-muted-foreground">AI</span>
+                        <span className={`inline-flex items-center justify-center min-w-[18px] px-1.5 py-0.5 rounded text-[11px] font-semibold ${item.ai_score >= 8 ? 'bg-green-500/20 text-green-400' : item.ai_score >= 6 ? 'bg-primary/20 text-primary' : item.ai_score >= 4 ? 'bg-amber-500/20 text-amber-400' : 'bg-red-500/20 text-red-400'}`}>
+                          {item.ai_score}
+                        </span>
+                      </div>
+                    )}
                   </div>
                 </div>
                 <div className="mt-2 text-[12px] text-foreground line-clamp-2">{item.signal || item.reason || '--'}</div>
@@ -768,6 +776,20 @@ export default function OpportunitiesPage() {
                   <div>相对强弱: {crossFeature.relative_strength_pct != null ? `${Number(crossFeature.relative_strength_pct).toFixed(0)}分位` : '--'}</div>
                   <div>事件催化: {eventScore != null ? eventScore.toFixed(1) : '--'}{eventCount > 0 ? `（${eventCount}条）` : '（无命中）'}</div>
                 </div>
+                {item.factor_explain && (((item.factor_explain.positive?.length ?? 0) > 0) || ((item.factor_explain.negative?.length ?? 0) > 0)) && (
+                  <div className="mt-2 flex flex-wrap gap-1">
+                    {(item.factor_explain.positive ?? []).map((f) => (
+                      <span key={`p-${f.factor}`} className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] bg-green-500/15 text-green-400">
+                        {f.label} +{Math.abs(f.contribution).toFixed(1)}
+                      </span>
+                    ))}
+                    {(item.factor_explain.negative ?? []).map((f) => (
+                      <span key={`n-${f.factor}`} className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] bg-red-500/15 text-red-400">
+                        {f.label} {f.contribution.toFixed(1)}
+                      </span>
+                    ))}
+                  </div>
+                )}
                 {item.constrained && (
                   <div className="mt-2 text-[10px] text-amber-400">
                     组合约束: {(item.constraint_reasons || []).join('；') || '已自动降级'}

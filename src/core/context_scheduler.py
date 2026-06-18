@@ -103,6 +103,24 @@ class ContextMaintenanceScheduler:
                 rebalance.get("checked", 0),
                 rebalance.get("skipped_low_sample", 0),
             )
+
+            # Phase 4: 因子 IC/IR 评估纳入定时闭环(只评估+记录,供调权与机会页参考)
+            try:
+                from src.core.factor_eval import evaluate_factor_ic
+
+                ic = await asyncio.to_thread(evaluate_factor_ic, days=90, horizon=5)
+                ics = {
+                    k: v.get("ic")
+                    for k, v in ic.get("factors", {}).items()
+                    if v.get("ic") is not None
+                }
+                logger.log(
+                    logging.INFO if ics else logging.DEBUG,
+                    "[上下文维护] 因子IC评估完成: %s",
+                    ics,
+                )
+            except Exception as ic_err:
+                logger.debug("[上下文维护] 因子IC评估跳过: %s", ic_err)
         except Exception as e:
             logger.exception(f"[上下文维护] 后验评估异常: {e}")
         finally:
