@@ -69,7 +69,8 @@ def spearman(xs: list[float], ys: list[float]) -> float | None:
 
 
 def evaluate_factor_ic(
-    *, days: int = 90, horizon: int = 5, min_samples: int = 20, min_period_samples: int = 5
+    *, days: int = 90, horizon: int = 5, min_samples: int = 20, min_period_samples: int = 5,
+    market: str | None = None, db=None,
 ) -> dict:
     """计算各因子的 IC/IR。
 
@@ -79,10 +80,14 @@ def evaluate_factor_ic(
         min_samples: 全样本 IC 的最小样本量
         min_period_samples: 单日 IC 的最小样本量(用于 IR 的时序序列)
     """
-    db = SessionLocal()
+    own = db is None
+    db = db or SessionLocal()
     try:
         cutoff = (date.today() - timedelta(days=max(7, int(days)))).strftime("%Y-%m-%d")
-        rows = (
+        # 防泄漏(point-in-time):只纳入持有期已走完的样本
+        # (snapshot_date + horizon 日历日 <= today),杜绝偷看未实现收益。
+        horizon_cutoff = (date.today() - timedelta(days=int(horizon))).strftime("%Y-%m-%d")
+        query = (
             db.query(StrategyFactorSnapshot, StrategyOutcome.outcome_return_pct)
             .join(
                 StrategyOutcome,
@@ -93,9 +98,12 @@ def evaluate_factor_ic(
                 StrategyOutcome.outcome_status.in_(("evaluated", "hit_target", "hit_stop")),
                 StrategyOutcome.outcome_return_pct.isnot(None),
                 StrategyFactorSnapshot.snapshot_date >= cutoff,
+                StrategyFactorSnapshot.snapshot_date <= horizon_cutoff,
             )
-            .all()
         )
+        if market:
+            query = query.filter(StrategyFactorSnapshot.stock_market == market)
+        rows = query.all()
 
         all_xy: dict[str, tuple[list[float], list[float]]] = {f: ([], []) for f in FACTOR_FIELDS}
         by_date: dict[str, dict[str, tuple[list[float], list[float]]]] = {}
@@ -145,9 +153,11 @@ def evaluate_factor_ic(
                 "ic_periods": len(period_ics),
             }
 
-        return {"horizon": int(horizon), "days": int(days), "factors": factors}
+        return {"horizon": int(horizon), "days": int(days), "market": market, "factors": factors}
     except Exception as e:
         logger.warning(f"[因子评估] IC 计算失败: {e}")
-        return {"horizon": int(horizon), "days": int(days), "factors": {}, "error": str(e)}
+        return {"horizon": int(horizon), "days": int(days), "market": market,
+                "factors": {}, "error": str(e)}
     finally:
-        db.close()
+        if own:
+            db.close()
