@@ -9,7 +9,6 @@ import { Switch } from '@panwatch/base-ui/components/ui/switch'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@panwatch/base-ui/components/ui/dialog'
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '@panwatch/base-ui/components/ui/select'
 import { useToast } from '@panwatch/base-ui/components/ui/toast'
-import FactorWeightsPanel from '@/components/FactorWeightsPanel'
 
 interface Setting {
   key: string
@@ -568,7 +567,6 @@ export default function SettingsPage() {
     { id: 'sec-system', label: '系统', hint: health?.timezone ? `TZ ${health.timezone}` : undefined },
     { id: 'sec-pack', label: '配置包' },
     { id: 'sec-feedback', label: '反馈' },
-    { id: 'sec-factors', label: '因子权重' },
   ]
 
   const scrollTo = (id: string) => {
@@ -1001,9 +999,6 @@ export default function SettingsPage() {
             <div className="text-[12px] text-muted-foreground">暂无反馈数据</div>
           )}
         </section>
-
-        {/* Factor Weights Self-Calibration */}
-        <FactorWeightsPanel />
 
       </div>
 

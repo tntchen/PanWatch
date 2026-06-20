@@ -12,6 +12,7 @@ import { Button } from '@panwatch/base-ui/components/ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@panwatch/base-ui/components/ui/select'
 import { useLocalStorage } from '@/lib/utils'
 import StockInsightModal from '@panwatch/biz-ui/components/stock-insight-modal'
+import FactorWeightsPanel from '@/components/FactorWeightsPanel'
 
 type SourceFilter = 'all' | 'market_scan' | 'watchlist' | 'mixed'
 type HoldingFilter = 'all' | 'held' | 'unheld'
@@ -811,6 +812,16 @@ export default function OpportunitiesPage() {
       {!loading && groupedItems.length === 0 && (
         <div className="card p-8 text-center text-[12px] text-muted-foreground mt-4">暂无满足条件的机会</div>
       )}
+
+      <details className="mt-6 group">
+        <summary className="cursor-pointer list-none flex items-center gap-2 text-[12px] font-medium text-muted-foreground hover:text-foreground transition-colors">
+          <span className="text-[11px] opacity-60 transition-transform group-open:rotate-90">▶</span>
+          因子权重与战绩
+        </summary>
+        <div className="mt-3">
+          <FactorWeightsPanel />
+        </div>
+      </details>
 
       <StockInsightModal
         open={insightOpen}
