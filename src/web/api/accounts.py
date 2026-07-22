@@ -779,6 +779,26 @@ def _fetch_quotes_for_stocks(stocks: list[Stock]) -> dict:
 # 持仓变动即失效(指纹变);失败/空结果不缓存,避免把瞬时故障冻住 10 分钟。
 _PORTFOLIO_RESULT_CACHE = TTLCache(default_ttl_sec=600.0)
 
+# ── 缓存 key 租户化（MT-P2，docs/22 §2.4 / docs/26-J11）──────────────────
+try:  # 防御：tenant_context 不可用时退化为全局缓存（等价单租户）
+    from src.web.tenant_context import current_tenant as _current_tenant
+except Exception:  # pragma: no cover - 防御性兜底
+    _current_tenant = None  # type: ignore[assignment]
+
+
+def _tenant_cache_prefix() -> str:
+    """缓存 key 租户前缀：有 ctx 用其 tenant_id，无 ctx（裸脚本/公开路由）兜底 0。
+
+    单租户直通模式（PANWATCH_SINGLE_TENANT=1）下所有 key 同前缀，行为不变。
+    """
+    if _current_tenant is None:
+        return "0"
+    try:
+        ctx = _current_tenant()
+    except Exception:  # pragma: no cover - 防御性兜底
+        return "0"
+    return str(ctx.tenant_id) if ctx is not None else "0"
+
 
 def _holdings_signature(db: Session) -> str:
     """启用账户持仓的稳定指纹(stock_id + 合并后数量);仅查 DB,不拉行情/K 线。"""
@@ -861,7 +881,7 @@ def portfolio_benchmark(
     sig = _holdings_signature(db)
     if not sig:
         return {"empty": True, "reason": "no_holdings"}
-    ckey = f"bench:{days}:{bcode}:{sig}"
+    ckey = f"{_tenant_cache_prefix()}:bench:{days}:{bcode}:{sig}"
     cached = _PORTFOLIO_RESULT_CACHE.get(ckey)
     if cached is not None:
         return cached
@@ -938,7 +958,7 @@ def portfolio_attribution(days: int = 60, benchmark: str = "000300", db: Session
     sig = _holdings_signature(db)
     if not sig:
         return {"items": []}
-    ckey = f"attr:{days}:{bcode}:{sig}"
+    ckey = f"{_tenant_cache_prefix()}:attr:{days}:{bcode}:{sig}"
     cached = _PORTFOLIO_RESULT_CACHE.get(ckey)
     if cached is not None:
         return cached

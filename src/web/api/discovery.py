@@ -19,6 +19,33 @@ logger = logging.getLogger(__name__)
 
 _cache: dict[str, tuple[float, object]] = {}
 
+# ── 缓存 key 租户化（MT-P2，docs/22 §8 / docs/26-J11）────────────────────
+# boards/board_stocks 的合成板块用本租户 watchlist 参与构建 → key 必须带租户，
+# 否则跨租户互相命中对方的合成板块。
+try:  # 防御：tenant_context 不可用时退化为全局缓存（等价单租户）
+    from src.web.tenant_context import current_tenant as _current_tenant
+except Exception:  # pragma: no cover - 防御性兜底
+    _current_tenant = None  # type: ignore[assignment]
+
+
+def _tenant_cache_prefix() -> str:
+    """缓存 key 租户前缀：有 ctx 用其 tenant_id，无 ctx（裸脚本/公开路由）兜底 0。
+
+    单租户直通模式（PANWATCH_SINGLE_TENANT=1）下所有 key 同前缀，行为不变。
+    """
+    if _current_tenant is None:
+        return "0"
+    try:
+        ctx = _current_tenant()
+    except Exception:  # pragma: no cover - 防御性兜底
+        return "0"
+    return str(ctx.tenant_id) if ctx is not None else "0"
+
+
+def _scoped_key(key: str) -> str:
+    """统一在读写两侧给缓存 key 加租户前缀（一处收口，覆盖全部端点）。"""
+    return f"{_tenant_cache_prefix()}:{key}"
+
 
 def _resolve_proxy() -> str:
     # Prefer UI-configured proxy, fallback to env settings.
@@ -32,7 +59,7 @@ def _resolve_proxy() -> str:
 
 def _cache_get(key: str, ttl_s: int) -> object | None:
     now = time.time()
-    hit = _cache.get(key)
+    hit = _cache.get(_scoped_key(key))
     if not hit:
         return None
     ts, obj = hit
@@ -42,7 +69,7 @@ def _cache_get(key: str, ttl_s: int) -> object | None:
 
 
 def _cache_set(key: str, obj: object) -> None:
-    _cache[key] = (time.time(), obj)
+    _cache[_scoped_key(key)] = (time.time(), obj)
 
 
 def _to_number(value) -> float | None:

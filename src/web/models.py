@@ -23,6 +23,8 @@ class AIService(Base):
     __tablename__ = "ai_services"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    # MT-P2：T18 租户隔离列，默认租户=1（v120 加列，server_default 保证存量行回填）
+    tenant_id = Column(Integer, nullable=False, server_default="1", index=True)
     name = Column(String, nullable=False)  # "OpenAI", "智谱", "DeepSeek"
     base_url = Column(String, nullable=False)
     api_key = Column(String, default="")
@@ -39,6 +41,7 @@ class AIModel(Base):
     __tablename__ = "ai_models"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, nullable=False, server_default="1", index=True)
     name = Column(String, nullable=False)  # 显示名，如 "GLM-4-Flash"
     service_id = Column(
         Integer, ForeignKey("ai_services.id", ondelete="CASCADE"), nullable=False
@@ -54,11 +57,14 @@ class NotifyChannel(Base):
     __tablename__ = "notify_channels"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, nullable=False, server_default="1", index=True)
     name = Column(String, nullable=False)
     type = Column(String, nullable=False)  # "telegram"
     config = Column(JSON, default={})  # {"bot_token": "...", "chat_id": "..."}
     enabled = Column(Boolean, default=True)
     is_default = Column(Boolean, default=False)
+    # MT-P2：T21/docs/21 §3.4，1=管理员托管渠道可被其他租户引用（不见 config 密钥）
+    is_shared = Column(Boolean, nullable=False, server_default="0", default=False)
     created_at = Column(DateTime, server_default=func.now())
 
 
@@ -68,6 +74,7 @@ class Account(Base):
     __tablename__ = "accounts"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, nullable=False, server_default="1", index=True)
     name = Column(String, nullable=False)  # 账户名称，如 "招商证券"、"华泰证券"
     available_funds = Column(Float, default=0)  # 可用资金
     enabled = Column(Boolean, default=True)
@@ -81,8 +88,15 @@ class Account(Base):
 
 class Stock(Base):
     __tablename__ = "stocks"
+    # MT-P2：docs/21 §4.6，v121 新增 (tenant_id,symbol,market) 复合 UQ（T15 每租户复制）
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "symbol", "market", name="uq_stocks_tenant_symbol_market"
+        ),
+    )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, nullable=False, server_default="1", index=True)
     symbol = Column(String, nullable=False)
     name = Column(String, nullable=False)
     market = Column(String, nullable=False)  # CN / HK / US
@@ -111,6 +125,7 @@ class Position(Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, nullable=False, server_default="1", index=True)
     account_id = Column(
         Integer, ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False
     )
@@ -152,6 +167,7 @@ class PositionTrade(Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, nullable=False, server_default="1", index=True)
     position_id = Column(
         Integer, ForeignKey("positions.id", ondelete="CASCADE"), nullable=False
     )
@@ -176,6 +192,7 @@ class StockAgent(Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, nullable=False, server_default="1", index=True)
     stock_id = Column(
         Integer, ForeignKey("stocks.id", ondelete="CASCADE"), nullable=False
     )
@@ -219,6 +236,7 @@ class AgentRun(Base):
     __tablename__ = "agent_runs"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, nullable=False, server_default="1", index=True)
     agent_name = Column(String, nullable=False)
     status = Column(String, nullable=False)  # success / failed
     trace_id = Column(String, default="")
@@ -242,6 +260,7 @@ class LogEntry(Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, nullable=False, server_default="1", index=True)
     timestamp = Column(DateTime, nullable=False)
     level = Column(String, nullable=False)
     logger_name = Column(String, default="")
@@ -312,6 +331,7 @@ class NotifyThrottle(Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, nullable=False, server_default="1", index=True)
     agent_name = Column(String, nullable=False)
     stock_symbol = Column(String, nullable=False)
     last_notify_at = Column(DateTime, nullable=False)
@@ -323,12 +343,18 @@ class AnalysisHistory(Base):
 
     __tablename__ = "analysis_history"
     __table_args__ = (
+        # MT-P2：docs/21 §4.2，v121 重建加 tenant_id 前缀（跨租户互覆裁决 M5）
         UniqueConstraint(
-            "agent_name", "stock_symbol", "analysis_date", name="uq_agent_stock_date"
+            "tenant_id",
+            "agent_name",
+            "stock_symbol",
+            "analysis_date",
+            name="uq_agent_stock_date",
         ),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, nullable=False, server_default="1", index=True)
     agent_name = Column(String, nullable=False)  # "daily_report" / "premarket_outlook"
     stock_symbol = Column(String, nullable=False)  # 股票代码，"*" 表示全部
     analysis_date = Column(String, nullable=False)  # 分析日期 "YYYY-MM-DD"
@@ -345,7 +371,9 @@ class StockContextSnapshot(Base):
 
     __tablename__ = "stock_context_snapshots"
     __table_args__ = (
+        # MT-P2：docs/21 §4.3，v121 重建加 tenant_id 前缀（R2 改判私有）
         UniqueConstraint(
+            "tenant_id",
             "symbol",
             "market",
             "snapshot_date",
@@ -361,6 +389,7 @@ class StockContextSnapshot(Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, nullable=False, server_default="1", index=True)
     symbol = Column(String, nullable=False)
     market = Column(String, nullable=False)  # CN/HK/US
     snapshot_date = Column(String, nullable=False)  # YYYY-MM-DD
@@ -375,7 +404,9 @@ class NewsTopicSnapshot(Base):
 
     __tablename__ = "news_topic_snapshots"
     __table_args__ = (
+        # MT-P2：docs/21 §4.4，v121 重建加 tenant_id 前缀（R2 改判私有）
         UniqueConstraint(
+            "tenant_id",
             "snapshot_date",
             "window_days",
             name="uq_news_topic_snapshot_date_window",
@@ -384,6 +415,7 @@ class NewsTopicSnapshot(Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, nullable=False, server_default="1", index=True)
     snapshot_date = Column(String, nullable=False)  # YYYY-MM-DD
     window_days = Column(Integer, nullable=False, default=7)
     symbols = Column(JSON, default=[])
@@ -404,6 +436,7 @@ class AgentContextRun(Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, nullable=False, server_default="1", index=True)
     agent_name = Column(String, nullable=False)
     stock_symbol = Column(String, nullable=False, default="*")
     analysis_date = Column(String, nullable=False)  # YYYY-MM-DD
@@ -427,6 +460,7 @@ class AgentPredictionOutcome(Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, nullable=False, server_default="1", index=True)
     agent_name = Column(String, nullable=False)
     stock_symbol = Column(String, nullable=False)
     stock_market = Column(String, nullable=False, default="CN")
@@ -450,6 +484,7 @@ class StockSuggestion(Base):
     __tablename__ = "stock_suggestions"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, nullable=False, server_default="1", index=True)
     stock_symbol = Column(String, nullable=False, index=True)
     stock_market = Column(String, nullable=False, default="CN", index=True)
     stock_name = Column(String, default="")
@@ -498,7 +533,9 @@ class EntryCandidate(Base):
 
     __tablename__ = "entry_candidates"
     __table_args__ = (
+        # MT-P2：docs/21 §4.5，v121 重建加 tenant_id 前缀（T19；市场级行 tenant_id=0 哨兵）
         UniqueConstraint(
+            "tenant_id",
             "stock_symbol",
             "stock_market",
             "snapshot_date",
@@ -509,6 +546,7 @@ class EntryCandidate(Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, nullable=False, server_default="1", index=True)
     stock_symbol = Column(String, nullable=False)
     stock_market = Column(String, nullable=False, default="CN")
     stock_name = Column(String, default="")
@@ -578,6 +616,7 @@ class EntryCandidateFeedback(Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, nullable=False, server_default="1", index=True)
     snapshot_date = Column(String, nullable=False, default="")  # YYYY-MM-DD
     stock_symbol = Column(String, nullable=False)
     stock_market = Column(String, nullable=False, default="CN")
@@ -603,6 +642,7 @@ class EntryCandidateOutcome(Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, nullable=False, server_default="1", index=True)
     candidate_id = Column(Integer, ForeignKey("entry_candidates.id", ondelete="CASCADE"), nullable=False)
     snapshot_date = Column(String, nullable=False, default="")
     stock_symbol = Column(String, nullable=False)
@@ -664,6 +704,8 @@ class StrategySignalRun(Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    # MT-P2：docs/26-J2，market_scan/mixed 源行=0 哨兵，watchlist 源行=候选 tenant
+    tenant_id = Column(Integer, nullable=False, server_default="1", index=True)
     snapshot_date = Column(String, nullable=False)  # YYYY-MM-DD
     stock_symbol = Column(String, nullable=False)
     stock_market = Column(String, nullable=False, default="CN")
@@ -720,6 +762,8 @@ class StrategyOutcome(Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    # MT-P2：docs/21 #28，tenant_id 由父 strategy_signal_runs 派生（T18 不变量）
+    tenant_id = Column(Integer, nullable=False, server_default="1", index=True)
     signal_run_id = Column(
         Integer, ForeignKey("strategy_signal_runs.id", ondelete="CASCADE"), nullable=False
     )
@@ -933,6 +977,7 @@ class SuggestionFeedback(Base):
     __tablename__ = "suggestion_feedback"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, nullable=False, server_default="1", index=True)
     suggestion_id = Column(
         Integer,
         ForeignKey("stock_suggestions.id", ondelete="CASCADE"),
@@ -953,6 +998,7 @@ class PriceAlertRule(Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, nullable=False, server_default="1", index=True)
     stock_id = Column(
         Integer, ForeignKey("stocks.id", ondelete="CASCADE"), nullable=False
     )
@@ -991,6 +1037,7 @@ class PriceAlertHit(Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, nullable=False, server_default="1", index=True)
     rule_id = Column(
         Integer, ForeignKey("price_alert_rules.id", ondelete="CASCADE"), nullable=False
     )
@@ -1025,6 +1072,7 @@ class StockPlaybook(Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, nullable=False, server_default="1", index=True)
     stock_id = Column(
         Integer, ForeignKey("stocks.id", ondelete="CASCADE"), nullable=False
     )
@@ -1042,8 +1090,13 @@ class PaperTradingAccount(Base):
     """模拟盘账户（单例）"""
 
     __tablename__ = "paper_trading_account"
+    __table_args__ = (
+        # MT-P2：docs/21 §3.3，T9 每租户一账户（迁移侧 CREATE UNIQUE INDEX 同名）
+        Index("uq_paper_account_tenant", "tenant_id", unique=True),
+    )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, nullable=False, server_default="1")
     initial_capital = Column(Float, nullable=False, default=1000000.0)
     current_capital = Column(Float, nullable=False, default=1000000.0)
     total_pnl = Column(Float, nullable=False, default=0.0)
@@ -1066,9 +1119,18 @@ class PaperTradingPosition(Base):
     __table_args__ = (
         Index("ix_paper_pos_status", "status"),
         Index("ix_paper_pos_symbol_market", "stock_symbol", "stock_market"),
+        # MT-P2：docs/21 §4.7，v121 重建新增（account_id, status）索引
+        Index("ix_paper_pos_account_status", "account_id", "status"),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, nullable=False, server_default="1", index=True)
+    # MT-P2：T9 前置，docs/21 §3.3/§4.7；v120 加可空列回填，v121 迁移重建收紧 NOT NULL
+    account_id = Column(
+        Integer,
+        ForeignKey("paper_trading_account.id", ondelete="CASCADE"),
+        nullable=True,
+    )
     stock_symbol = Column(String, nullable=False)
     stock_market = Column(String, nullable=False, default="CN")
     stock_name = Column(String, default="")
@@ -1096,9 +1158,18 @@ class PaperTradingTrade(Base):
     __table_args__ = (
         Index("ix_paper_trade_closed", "closed_at"),
         Index("ix_paper_trade_symbol", "stock_symbol", "stock_market"),
+        # MT-P2：docs/21 §4.8，v121 重建新增（account_id, closed_at）索引
+        Index("ix_paper_trade_account_closed", "account_id", "closed_at"),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, nullable=False, server_default="1", index=True)
+    # MT-P2：T9 前置，docs/21 §3.3/§4.8；v120 加可空列回填，v121 迁移重建收紧 NOT NULL
+    account_id = Column(
+        Integer,
+        ForeignKey("paper_trading_account.id", ondelete="CASCADE"),
+        nullable=True,
+    )
     stock_symbol = Column(String, nullable=False)
     stock_market = Column(String, nullable=False, default="CN")
     stock_name = Column(String, default="")
@@ -1127,6 +1198,7 @@ class ChatConversation(Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, nullable=False, server_default="1", index=True)
     title = Column(String, default="")
     stock_symbol = Column(String, nullable=True)
     stock_market = Column(String, nullable=True)
@@ -1145,7 +1217,174 @@ class ChatMessage(Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, nullable=False, server_default="1", index=True)
     conversation_id = Column(Integer, nullable=False)
     role = Column(String, nullable=False, default="user")  # user/assistant/system
     content = Column(Text, nullable=False, default="")
     created_at = Column(DateTime, server_default=func.now())
+
+
+# ---------------------------------------------------------------------------
+# MT-P1 身份骨架（多租户改造 Phase 1）
+# 设计依据：docs/21-MT-P0-schema变更清单.md §2（tenants/users DDL）、
+#           docs/25-MT-P0-身份穿透设计.md §2.1、docs/17 v1.1（T1/T5/T12/T13/T20）。
+# 行为约束：MT-P1 上线等价单用户——仅默认租户(id=1) + 一个 admin；
+# 新表走 create_all 惯例，不写版本化迁移（v120 属 MT-P2）。
+# ---------------------------------------------------------------------------
+
+
+class Tenant(Base):
+    """租户（MT-P1；T12 邀请制字段一并落地，registration_enabled 默认关闭）"""
+
+    __tablename__ = "tenants"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String, nullable=False)  # 显示名，默认租户为 "默认租户"
+    is_default = Column(Boolean, nullable=False, default=False)  # 默认租户(id=1)标记
+    status = Column(String, nullable=False, default="active")  # active / disabled
+    max_users = Column(Integer, nullable=False, default=5)  # T1：N<=5 硬上限
+    invite_code = Column(String, default="")  # T12：邀请码，空=未开放
+    invite_expires_at = Column(DateTime, nullable=True)  # 邀请码过期时间，NULL=不过期
+    registration_enabled = Column(
+        Boolean, nullable=False, default=False
+    )  # T12/M1：MT-P1 上线即关注册
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    users = relationship(
+        "User", back_populates="tenant", cascade="all, delete-orphan"
+    )
+
+
+class User(Base):
+    """用户（MT-P1；T5 两级 role、T13 配额共享布尔位、M10 透明重哈希）"""
+
+    __tablename__ = "users"
+    __table_args__ = (
+        Index("ix_users_tenant", "tenant_id"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(
+        Integer,
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+        default=1,  # T18：默认租户=1
+    )
+    username = Column(String, unique=True, nullable=False)  # 全局唯一，用户名定租户
+    password_hash = Column(String, nullable=False)
+    password_algo = Column(
+        String, nullable=False, default="bcrypt"
+    )  # bcrypt / sha256_legacy（M10：legacy 首次登录透明重哈希）
+    role = Column(String, nullable=False, default="user")  # admin / user（T5）
+    quota_shared_with_admin = Column(
+        Boolean, nullable=False, default=False
+    )  # T13：True=与管理员共享 AI 配额
+    is_active = Column(Boolean, nullable=False, default=True)
+    pwd_changed_at = Column(
+        DateTime, nullable=True
+    )  # 密码最后修改时间，对应 JWT pwd_at 吊销 claim（docs/25 §1.1）
+    invited_by = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )  # T12 邀请人（管理员）
+    last_login_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    tenant = relationship("Tenant", back_populates="users")
+
+
+# ---------------------------------------------------------------------------
+# MT-P2 数据层新表（多租户改造 Phase 2）
+# 设计依据：docs/21-MT-P0-schema变更清单.md §7（tenant_settings / tenant_news_pushed
+# / agent_config_overrides DDL）、docs/26-MT-P0-汇总与裁决.md J6（override 禁含
+# schedule 字段）。
+# 新表走 create_all + v120 迁移 CREATE TABLE IF NOT EXISTS 双轨，DDL 需保持一致。
+# ---------------------------------------------------------------------------
+
+
+class TenantSettings(Base):
+    """租户级 KV 设置（MT-P2，T20；docs/21 §7.1）
+
+    存 notify_quiet_hours / notify_retry_* / ui_avatar 等从 app_settings 三分
+    迁出的租户级键；复合主键 (tenant_id, key) 与 v120 DDL 一致。
+    """
+
+    __tablename__ = "tenant_settings"
+
+    tenant_id = Column(
+        Integer,
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    key = Column(String, primary_key=True)
+    value = Column(String, default="")
+    description = Column(String, default="")
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class TenantNewsPushed(Base):
+    """租户新闻已推记录（MT-P2，T8；docs/21 §7.3）
+
+    news_cache 全实例一份共享去重；某条新闻对某租户推送成功后写一行。
+    新租户注册不回填历史行 → 天然"不补发"。
+    """
+
+    __tablename__ = "tenant_news_pushed"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "news_id", name="uq_tenant_news_pushed"
+        ),
+        Index("ix_tenant_news_pushed_news", "news_id"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(
+        Integer,
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    news_id = Column(
+        Integer,
+        ForeignKey("news_cache.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    channel_id = Column(Integer, nullable=True)  # 推送所用渠道（可空，便于排查）
+    pushed_at = Column(DateTime, server_default=func.now())
+
+
+class AgentConfigOverride(Base):
+    """租户级 Agent 配置覆盖（MT-P2，T4；docs/21 §7.4 + docs/26-J6）
+
+    整体替换语义：行存在即以其非空字段全集覆盖 agent_configs 模板同名字段。
+    J6 裁决：禁含 schedule 字段——调度 cadence 全实例唯一（T17 单 job 硬约束），
+    override 只允许 enabled / execution_mode / ai_model_id / notify_channel_ids /
+    config 类字段。
+    优先级链：stock_agent（行内配置） > 本表 > agent_configs 模板 > 系统默认。
+    """
+
+    __tablename__ = "agent_config_overrides"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "agent_name", name="uq_agent_override_tenant_name"
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(
+        Integer,
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    agent_name = Column(String, nullable=False)  # 对应 agent_configs.name（跨表字符串键）
+    enabled = Column(Boolean, nullable=True)  # NULL=不覆盖该字段
+    execution_mode = Column(String, nullable=True)  # batch / single
+    ai_model_id = Column(
+        Integer, ForeignKey("ai_models.id", ondelete="SET NULL"), nullable=True
+    )
+    notify_channel_ids = Column(JSON, nullable=True)
+    config = Column(JSON, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

@@ -30,10 +30,30 @@ _SCAN_CACHE_TTL_SECONDS = {
     True: 25.0,   # AI scan
 }
 
+# ── 缓存 key 租户化（MT-P2，docs/22 §2.5 / docs/26-J11）──────────────────
+try:  # 防御：tenant_context 不可用时退化为全局缓存（等价单租户）
+    from src.web.tenant_context import current_tenant as _current_tenant
+except Exception:  # pragma: no cover - 防御性兜底
+    _current_tenant = None  # type: ignore[assignment]
+
+
+def _tenant_cache_prefix() -> str:
+    """缓存 key 租户前缀：有 ctx 用其 tenant_id，无 ctx（裸脚本/公开路由）兜底 0。
+
+    单租户直通模式（PANWATCH_SINGLE_TENANT=1）下所有 key 同前缀，行为不变。
+    """
+    if _current_tenant is None:
+        return "0"
+    try:
+        ctx = _current_tenant()
+    except Exception:  # pragma: no cover - 防御性兜底
+        return "0"
+    return str(ctx.tenant_id) if ctx is not None else "0"
+
 
 def _build_scan_cache_key(analyze: bool, watchlist) -> str:
     symbols = sorted(f"{s.market.value}:{s.symbol}" for s in watchlist)
-    return f"intraday_scan:{int(analyze)}:{'|'.join(symbols)}"
+    return f"{_tenant_cache_prefix()}:intraday_scan:{int(analyze)}:{'|'.join(symbols)}"
 
 
 def _get_scan_cache(key: str, analyze: bool) -> dict | None:

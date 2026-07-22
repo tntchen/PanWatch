@@ -39,6 +39,7 @@ from src.web.api import insights
 from src.web.api.auth import get_current_user
 from src.web.api.settings import get_app_version
 from src.web.response import ResponseWrapperMiddleware
+from src.web.tenant_context import TenantContextMiddleware
 
 app = FastAPI(
     title="PanWatch API",
@@ -54,6 +55,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# MT-P1 身份穿透：每请求强制清空租户 contextvar（防 anyio 线程复用串租户）。
+# 最后 add_middleware = 最外层，确保先于 ResponseWrapper/CORS 执行清理。
+app.add_middleware(TenantContextMiddleware)
 
 # 认证路由（无需登录）
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])

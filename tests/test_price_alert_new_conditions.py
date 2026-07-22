@@ -497,10 +497,12 @@ def test_m119_adds_playbook_id_idempotent():
 
 
 def test_m119_registered_last_after_118():
-    """v119 注册在迁移表末尾（118 之后），已发布迁移未被改动。"""
+    """迁移按版本序注册且无重复；v118/v119 相邻未被改动（v120–v122 为 MT-P2 新增）。"""
     from src.web.migrations import MIGRATIONS
 
     versions = [m.version for m in MIGRATIONS]
-    assert versions[-1] == 119
-    assert versions[-2] == 118
+    assert versions == sorted(versions)
     assert len(set(versions)) == len(versions)
+    pairs = list(zip(versions, versions[1:]))
+    assert (118, 119) in pairs
+    assert versions[-1] == 122

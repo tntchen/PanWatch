@@ -1,14 +1,29 @@
 """日志中心 API"""
+import os
 from datetime import datetime, timezone
+from typing import Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, or_
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from src.web.database import get_db
 from src.web.models import LogEntry
+from src.web.api.auth import get_current_user
 from src.web.log_handler import get_log_handler_stats
+
+
+def _resolve_role(user: Any) -> str:
+    """取当前用户角色；过渡期 get_current_user 可能返回 None/'user' 字符串。
+
+    PANWATCH_SINGLE_TENANT 默认 '1'（T20 单租户回退 flag）：单租户直通，
+    已认证用户一律视为 admin，保证 MT-P1 行为与单用户时代等价。
+    多租户模式下取 User.role；拿不到 role（旧返回形态）时默认放行。
+    """
+    if os.getenv("PANWATCH_SINGLE_TENANT", "1") == "1":
+        return "admin"
+    return getattr(user, "role", "admin")
 
 
 def _format_datetime(dt) -> str:
@@ -206,7 +221,13 @@ def list_logs(
 
 
 @router.delete("")
-def clear_logs(db: Session = Depends(get_db)):
+def clear_logs(
+    db: Session = Depends(get_db),
+    user: Any = Depends(get_current_user),
+):
+    # MT-P1 安全收口：清空全表仅管理员可操作（非管理员 403）；GET 日志保持现状
+    if _resolve_role(user) != "admin":
+        raise HTTPException(403, "清空日志仅管理员可操作")
     count = db.query(LogEntry).delete()
     db.commit()
     return {"deleted": count}

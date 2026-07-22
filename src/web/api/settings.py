@@ -1,11 +1,14 @@
 import base64
 import os
+from typing import Any
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
 from src.web.database import get_db
 from src.web.models import AppSettings
+from src.web.api.auth import get_current_user
 from src.config import Settings
 from src.core.update_checker import check_update
 
@@ -58,6 +61,38 @@ SETTING_DESCRIPTIONS = {
 }
 
 SETTING_KEYS = list(SETTING_DESCRIPTIONS.keys())
+
+# ---- MT-P1 写入白名单（docs/26-J10；映射依据 docs/21 §7.1 app_settings 三分表）----
+# 实例级：进程/全局一份，仅管理员可写
+INSTANCE_LEVEL_KEYS = frozenset({
+    "jwt_secret",
+    "http_proxy",
+    "panwatch_base_url",
+    "single_tenant_mode",
+})
+# 租户级：普通用户可写；MT-P1 阶段仍落全局 app_settings 行（tenant 化在 MT-P2）
+# stock_link_platform 未列入 docs/21 §7.1 映射表，按 UI 偏好归为租户级
+TENANT_LEVEL_KEYS = frozenset({
+    "notify_quiet_hours",
+    "notify_retry_attempts",
+    "notify_retry_backoff_seconds",
+    "notify_dedupe_ttl_overrides",
+    "ui_avatar",
+    "stock_link_platform",
+})
+
+
+def _resolve_role(user: Any) -> str:
+    """取当前用户角色；过渡期 get_current_user 可能返回 None/'user' 字符串。
+
+    PANWATCH_SINGLE_TENANT 默认 '1'（T20 单租户回退 flag）：单租户直通，
+    已认证用户一律视为 admin，保证 MT-P1 行为与单用户时代等价。
+    多租户模式下取 User.role；拿不到 role（旧返回形态）时默认放行，
+    避免过渡态打挂既有调用。
+    """
+    if os.getenv("PANWATCH_SINGLE_TENANT", "1") == "1":
+        return "admin"
+    return getattr(user, "role", "admin")
 
 
 def _get_env_defaults() -> dict[str, str]:
@@ -179,7 +214,19 @@ def set_avatar(update: SettingUpdate, db: Session = Depends(get_db)):
 
 
 @router.put("/{key}", response_model=SettingResponse)
-def update_setting(key: str, update: SettingUpdate, db: Session = Depends(get_db)):
+def update_setting(
+    key: str,
+    update: SettingUpdate,
+    db: Session = Depends(get_db),
+    user: Any = Depends(get_current_user),
+):
+    # MT-P1 白名单收口：未知 key 一律 400；实例级 key 仅管理员可写
+    if key in INSTANCE_LEVEL_KEYS:
+        if _resolve_role(user) != "admin":
+            raise HTTPException(403, "实例级配置仅管理员可修改")
+    elif key not in TENANT_LEVEL_KEYS:
+        raise HTTPException(400, f"不支持的配置项: {key}")
+
     setting = db.query(AppSettings).filter(AppSettings.key == key).first()
     if not setting:
         desc = SETTING_DESCRIPTIONS.get(key, "")

@@ -26,6 +26,27 @@ logger = logging.getLogger(__name__)
 # 公告解读缓存(公告不变,长 TTL)
 _ANN_CACHE = TTLCache(default_ttl_sec=21600)  # 6h
 
+# ── 缓存 key 租户化（MT-P2，docs/22 §2.3 / docs/26-J11）──────────────────
+# AI 解读消耗本租户配额/模型（T13），跨租户复用会白嫖且提示语串模型 → key 加租户。
+try:  # 防御：tenant_context 不可用时退化为全局缓存（等价单租户）
+    from src.web.tenant_context import current_tenant as _current_tenant
+except Exception:  # pragma: no cover - 防御性兜底
+    _current_tenant = None  # type: ignore[assignment]
+
+
+def _tenant_cache_prefix() -> str:
+    """缓存 key 租户前缀：有 ctx 用其 tenant_id，无 ctx（裸脚本/公开路由）兜底 0。
+
+    单租户直通模式（PANWATCH_SINGLE_TENANT=1）下所有 key 同前缀，行为不变。
+    """
+    if _current_tenant is None:
+        return "0"
+    try:
+        ctx = _current_tenant()
+    except Exception:  # pragma: no cover - 防御性兜底
+        return "0"
+    return str(ctx.tenant_id) if ctx is not None else "0"
+
 router = APIRouter()
 
 
@@ -314,7 +335,7 @@ class AnnouncementEvalRequest(BaseModel):
 async def announcement_eval(req: AnnouncementEvalRequest, db: Session = Depends(get_db)):
     """近期公告 → AI 逐条判利好/利空/中性 + 一句话。降级:无全文则用标题。"""
     market = _parse_market(req.market).value
-    cache_key = f"{market}:{req.symbol}"
+    cache_key = f"{_tenant_cache_prefix()}:{market}:{req.symbol}"
     cached = _ANN_CACHE.get(cache_key)
     if cached is not None:
         return cached

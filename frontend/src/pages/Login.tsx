@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { TrendingUp, Lock, Eye, EyeOff, User } from 'lucide-react'
-import { authApi } from '@panwatch/api'
+import { authApi, reconcileAuthIdentity } from '@panwatch/api'
 import { Button } from '@panwatch/base-ui/components/ui/button'
 import { Input } from '@panwatch/base-ui/components/ui/input'
 import { Label } from '@panwatch/base-ui/components/ui/label'
@@ -49,9 +49,26 @@ export default function LoginPage() {
         ? await authApi.setup({ username, password })
         : await authApi.login({ username, password })
 
-      // 保存 token
+      // 账号切换检测：先与上次身份比对（不一致会清掉旧业务键与旧 token），再写入新凭证
+      if (data.user) {
+        reconcileAuthIdentity({ user_id: data.user.id, tenant_id: data.user.tenant_id })
+      }
+      // 保存 token（新契约登录返回 {token, user}；expires_at 可选）
       localStorage.setItem('token', data.token)
-      localStorage.setItem('token_expires', data.expires_at)
+      if (data.expires_at) {
+        localStorage.setItem('token_expires', data.expires_at)
+      } else {
+        localStorage.removeItem('token_expires')
+      }
+      // 响应未携带 user 时（如 setup），用 /auth/me 补齐身份标记
+      if (!data.user) {
+        try {
+          const me = await authApi.me()
+          reconcileAuthIdentity({ user_id: me.id, tenant_id: me.tenant_id })
+        } catch {
+          // 忽略：App 启动后 AccountMenu 会再次拉取 /auth/me
+        }
+      }
 
       toast(isSetup ? '密码设置成功' : '登录成功', 'success')
       navigate('/')

@@ -1,7 +1,10 @@
+import glob
 import json
 import logging
 import os
+import re
 import shutil
+import sqlite3
 from datetime import datetime
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
@@ -111,24 +114,159 @@ def _drop_dangling_ai_provider_fk(conn, table: str) -> None:
             pass
 
 
-def _backup_db_before_migration() -> None:
-    """Create a timestamped sqlite backup before versioned migrations."""
-    if not os.path.exists(DB_PATH):
-        return
+# 备份轮转保留份数（T14 最小集：轮转 ≤3）
+_BACKUP_KEEP = 3
+
+# app_settings 中视为敏感的键（脱敏副本置空）：显式清单 + 通用模式兜底。
+# 依据 docs/21 §7.1 三分映射（jwt_secret 实例级、auth_*→users）与 docs/20-M9
+# （密钥静态泄露面）。模式覆盖未来新增的 *key*/*secret*/*token*/*password* 键。
+_SENSITIVE_APP_SETTING_KEYS = frozenset(
+    {"jwt_secret", "auth_username", "auth_password_hash"}
+)
+_SENSITIVE_KEY_PATTERN = re.compile(
+    r"(api_?key|secret|token|password|passwd)", re.IGNORECASE
+)
+
+
+def _backup_db_before_migration(
+    db_path: str = DB_PATH, keep: int = _BACKUP_KEEP
+) -> str:
+    """迁移前创建一致性备份 + 自检 + 轮转 + 脱敏出卷副本（docs/17 R5 / docs/20-C3）。
+
+    返回完整备份文件路径；库不存在或为空时返回 ""（跳过）。
+
+    取舍说明（一致性快照二选一）：选 ``VACUUM INTO`` 而非
+    ``wal_checkpoint(TRUNCATE) + copy2``。原因：
+      1. 旧实现 copy2 只拷主文件不拷 -wal/-shm，WAL 下是非一致性快照，
+         可能丢最近事务（docs/20-C3 判不可复用）；
+      2. ``VACUUM INTO`` 由 SQLite 自身经 WAL 读取生成自包含一致性快照，
+         对源库零写入；而 checkpoint(TRUNCATE) 会把 WAL 折回主文件，
+         属于对生产文件的写操作，备份动作不应改变源库状态；
+      3. 代价是全量重写一份文件，本项目库体积小，可接受。
+    失败语义：任何一步失败即抛异常阻断迁移（不再仅 warning），
+    否则「迁移失败可回滚」承诺落空（R5）。
+    """
+    if not os.path.exists(db_path):
+        return ""
     try:
-        size = os.path.getsize(DB_PATH)
-        if size <= 0:
-            return
-    except Exception:
-        return
+        if os.path.getsize(db_path) <= 0:
+            return ""
+    except OSError:
+        return ""
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_path = f"{DB_PATH}.bak.{ts}"
+    backup_path = f"{db_path}.bak.{ts}"
+    suffix = 1
+    while os.path.exists(backup_path):
+        backup_path = f"{db_path}.bak.{ts}_{suffix}"
+        suffix += 1
+
+    # 1) VACUUM INTO 生成一致性快照
+    escaped = backup_path.replace("'", "''")
+    src = sqlite3.connect(db_path, timeout=30)
     try:
-        shutil.copy2(DB_PATH, backup_path)
-        logger.info(f"数据库迁移前备份已创建: {backup_path}")
+        src.isolation_level = None  # autocommit：VACUUM 不能在事务内执行
+        src.execute(f"VACUUM INTO '{escaped}'")
+    except Exception:
+        try:
+            os.remove(backup_path)
+        except OSError:
+            pass
+        raise RuntimeError(f"数据库迁移前备份失败（VACUUM INTO）: {db_path}")
+    finally:
+        src.close()
+
+    # 2) 备份自检：integrity_check 不过即删除并抛错阻断迁移
+    _verify_backup_integrity(backup_path)
+    logger.info(f"数据库迁移前备份已创建并通过 integrity_check: {backup_path}")
+
+    # 3) 脱敏出卷副本（.sanitized）：schema 完整、敏感值置空，供出卷冷备
+    _create_sanitized_copy(backup_path)
+
+    # 4) 轮转：只保留最新 keep 份（连同其 .sanitized 副本一起淘汰）
+    _rotate_backups(db_path, keep)
+
+    return backup_path
+
+
+def _verify_backup_integrity(backup_path: str) -> None:
+    """对备份文件跑 PRAGMA integrity_check，失败即删文件并抛错。"""
+    conn = sqlite3.connect(backup_path, timeout=30)
+    try:
+        row = conn.execute("PRAGMA integrity_check").fetchone()
+        result = row[0] if row else ""
     except Exception as e:
-        logger.warning(f"数据库迁移前备份失败: {e}")
+        result = f"integrity_check 执行失败: {e}"
+    finally:
+        conn.close()
+    if result != "ok":
+        try:
+            os.remove(backup_path)
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"备份自检失败，已阻断迁移（integrity_check={result!r}）: {backup_path}"
+        )
+
+
+def _create_sanitized_copy(backup_path: str) -> str:
+    """生成脱敏出卷副本 <backup>.sanitized：剔密钥，保 schema 完整可恢复。
+
+    脱敏方式 = 置空值（不删行），保证表结构与行数不变、可直接恢复使用：
+      - ai_services.api_key → ''
+      - notify_channels.config → ''
+      - app_settings 中敏感 key 的 value → ''（显式清单 + 模式匹配）
+    表/列不存在时跳过（新库可能尚无这些表）。
+    """
+    sanitized_path = backup_path + ".sanitized"
+    shutil.copy2(backup_path, sanitized_path)
+    conn = sqlite3.connect(sanitized_path, timeout=30)
+    try:
+        cur = conn.cursor()
+        if _sqlite_has_column(cur, "ai_services", "api_key"):
+            cur.execute("UPDATE ai_services SET api_key = ''")
+        if _sqlite_has_column(cur, "notify_channels", "config"):
+            cur.execute("UPDATE notify_channels SET config = ''")
+        if _sqlite_has_column(cur, "app_settings", "key"):
+            rows = cur.execute("SELECT key FROM app_settings").fetchall()
+            for (key,) in rows:
+                if key in _SENSITIVE_APP_SETTING_KEYS or (
+                    isinstance(key, str) and _SENSITIVE_KEY_PATTERN.search(key)
+                ):
+                    cur.execute(
+                        "UPDATE app_settings SET value = '' WHERE key = ?", (key,)
+                    )
+        conn.commit()
+    finally:
+        conn.close()
+    logger.info(f"脱敏出卷副本已创建: {sanitized_path}")
+    return sanitized_path
+
+
+def _rotate_backups(db_path: str, keep: int) -> None:
+    """panwatch.db.bak.* 只保留最新 keep 份，超出删最旧（含 .sanitized）。"""
+    candidates = [
+        p
+        for p in glob.glob(f"{db_path}.bak.*")
+        if not p.endswith(".sanitized")
+    ]
+    candidates.sort()  # 文件名含时间戳，字典序即时间序
+    for old in candidates[:-keep] if keep > 0 else candidates:
+        for path in (old, old + ".sanitized"):
+            try:
+                os.remove(path)
+                logger.info(f"备份轮转删除: {path}")
+            except OSError:
+                pass
+
+
+def _sqlite_has_column(cur: sqlite3.Cursor, table: str, column: str) -> bool:
+    """裸 sqlite3 游标版列存在性判断（区别于 SQLAlchemy 版 _has_column）。"""
+    try:
+        cur.execute(f"SELECT {column} FROM {table} LIMIT 1")
+        return True
+    except sqlite3.Error:
+        return False
 
 
 def _migrate(engine):
@@ -540,3 +678,18 @@ FROM stocks
             conn.execute(text("PRAGMA foreign_keys=ON"))
             conn.commit()
             logger.info("已通过重建表移除 stocks.enabled 列")
+
+
+# ---------------------------------------------------------------------------
+# MT-P1 身份穿透机制点：do_orm_execute 租户自动过滤（docs/25 §3、docs/26-J12）
+# 事件挂全局 Session 工厂（SessionLocal）而非单个 engine/session，确保
+# log_handler / notify_dedupe / context_store / chat.py 等自建 SessionLocal()
+# 的路径同样被覆盖。默认 PANWATCH_SINGLE_TENANT='1' 单租户直通，行为等价
+# 单用户；注册表与过滤核心逻辑见 src/web/tenant_context.py。
+# ---------------------------------------------------------------------------
+from src.web.tenant_context import apply_tenant_filter  # noqa: E402
+
+
+@event.listens_for(SessionLocal, "do_orm_execute")
+def _apply_tenant_filter(execute_state):
+    apply_tenant_filter(execute_state)

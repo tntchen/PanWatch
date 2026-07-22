@@ -1543,12 +1543,16 @@ async def lifespan(app):
     setup_playwright()
 
     # 从环境变量初始化认证（Docker 部署用）
-    from src.web.api.auth import init_auth_from_env
+    # MT-P1：bootstrap 覆盖 env > app_settings > 随机密码全路径，且保证默认租户 id=1（T18/T20）
+    from src.web.bootstrap import ensure_default_tenant_and_admin
+    from src.web.tenant_context import refresh_tenant_column_cache
+    from src.web.database import engine as _engine
+
+    refresh_tenant_column_cache(_engine)  # 机制点反射缓存（v120 加列后需再调一次）
 
     db = SessionLocal()
     try:
-        if init_auth_from_env(db):
-            logger.info("已从环境变量初始化认证账号")
+        ensure_default_tenant_and_admin(db)
     finally:
         db.close()
 

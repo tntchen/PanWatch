@@ -22,6 +22,10 @@ class Migration:
     version: int
     name: str
     runner: Callable[[Connection], None]
+    # transactional=True（默认）：runner 在 engine.begin() 事务内执行，行为与
+    # v101-119 完全一致。False：runner 在独立连接上执行并自行管理逐表事务，
+    # 供 v121 __new 重建在事务外切换 PRAGMA foreign_keys（docs/17 R4）。
+    transactional: bool = True
 
     @property
     def checksum(self) -> str:
@@ -1595,6 +1599,1035 @@ def _m119_price_alert_rule_playbook_id(conn: Connection) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# MT-P2 数据层隔离（多租户）
+#
+# 蓝本：docs/21-MT-P0-schema变更清单.md §3–§5；裁决：docs/26-MT-P0-汇总与裁决.md
+#   v120：建表 + 加列 + 回填（§3，幂等可重入）
+#   v121：7 张表 __new 约束重建（§4，清半成品 + 行数对账）
+#   v122：对账（§5，独立连接，失配即 raise）
+# 要点：
+#   - tenant_id 一律 INTEGER NOT NULL DEFAULT 1（T18），裸列不加 FK（SQLite
+#     ADD COLUMN 限制，docs/21 §3.1）；FK 仅出现在 __new 重建表内。
+#   - agent_config_overrides 禁含 schedule 字段（docs/26-J6）。
+#   - notify_throttle 不重建 UQ，旧行 scope 回填 __notify__:1:{hash}（docs/26-J4、
+#     docs/23 §3.3）。
+#   - entry_candidates / strategy_signal_runs 允许 tenant_id=0 市场级哨兵
+#     （docs/26-J2/J3）；log_entries 系统日志允许 tenant_id=0（docs/26-J11）。
+# ---------------------------------------------------------------------------
+
+#: v120 需要加 tenant_id 的 A 类私有表（docs/21 §3.1 适用表清单，31 张）。
+MT_TENANT_TABLES_V120: tuple[str, ...] = (
+    "ai_services",
+    "ai_models",
+    "notify_channels",
+    "accounts",
+    "stocks",
+    "positions",
+    "position_trades",
+    "stock_agents",
+    "agent_runs",
+    "log_entries",
+    "notify_throttle",
+    "analysis_history",
+    "stock_context_snapshots",
+    "news_topic_snapshots",
+    "agent_context_runs",
+    "agent_prediction_outcomes",
+    "stock_suggestions",
+    "entry_candidates",
+    "entry_candidate_feedback",
+    "entry_candidate_outcomes",
+    "suggestion_feedback",
+    "price_alert_rules",
+    "price_alert_hits",
+    "stock_playbooks",
+    "paper_trading_account",
+    "paper_trading_positions",
+    "paper_trading_trades",
+    "chat_conversations",
+    "chat_messages",
+    "strategy_signal_runs",
+    "strategy_outcomes",
+)
+
+#: 允许 tenant_id=0（市场级哨兵 / 系统日志）的表（docs/26-J2/J3/J11）。
+MT_SENTINEL_ZERO_TABLES: frozenset[str] = frozenset(
+    {
+        "entry_candidates",
+        "strategy_signal_runs",
+        "strategy_outcomes",
+        "log_entries",
+    }
+)
+
+#: app_settings → tenant_settings(tenant_id=1) 复制的租户级键（T20，docs/21 §7.1
+#: + docs/26-J11 补 stock_link_platform；复制不删，读路径切换归 MT-P3/4）。
+_MT_TENANT_SETTING_KEYS: tuple[str, ...] = (
+    "ui_avatar",
+    "notify_quiet_hours",
+    "notify_retry_attempts",
+    "notify_retry_backoff_seconds",
+    "notify_dedupe_ttl_overrides",
+    "stock_link_platform",
+)
+
+
+def _m120_tenant_foundation(conn: Connection) -> None:
+    """v120：建表 + 加列 + 回填（docs/21 §3，全部幂等可重入）。"""
+    # 1. tenants / users 自包含 DDL（M3：防 create_all 未覆盖场景）。
+    #    与 models.py Tenant/User（MT-P1 已上线）逐列一致。
+    conn.execute(
+        text(
+            """
+CREATE TABLE IF NOT EXISTS tenants (
+  id INTEGER NOT NULL,
+  name VARCHAR NOT NULL,
+  is_default BOOLEAN NOT NULL,
+  status VARCHAR NOT NULL,
+  max_users INTEGER NOT NULL,
+  invite_code VARCHAR,
+  invite_expires_at DATETIME,
+  registration_enabled BOOLEAN NOT NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id)
+)
+"""
+        )
+    )
+    conn.execute(
+        text(
+            """
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER NOT NULL,
+  tenant_id INTEGER NOT NULL,
+  username VARCHAR NOT NULL,
+  password_hash VARCHAR NOT NULL,
+  password_algo VARCHAR NOT NULL,
+  role VARCHAR NOT NULL,
+  quota_shared_with_admin BOOLEAN NOT NULL,
+  is_active BOOLEAN NOT NULL,
+  pwd_changed_at DATETIME,
+  invited_by INTEGER,
+  last_login_at DATETIME,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  FOREIGN KEY(tenant_id) REFERENCES tenants (id) ON DELETE CASCADE,
+  UNIQUE (username),
+  FOREIGN KEY(invited_by) REFERENCES users (id) ON DELETE SET NULL
+)
+"""
+        )
+    )
+    _create_index_if_missing(
+        conn, "ix_users_tenant", "CREATE INDEX ix_users_tenant ON users(tenant_id)"
+    )
+
+    # 2. 回填默认租户 id=1（T18；与 src/web/bootstrap.py 口径一致）。
+    conn.execute(
+        text(
+            """
+INSERT INTO tenants (id, name, is_default, status, max_users, invite_code, registration_enabled)
+SELECT 1, '默认租户', 1, 'active', 5, '', 0
+WHERE NOT EXISTS (SELECT 1 FROM tenants WHERE id = 1)
+"""
+        )
+    )
+    conn.execute(
+        text("UPDATE tenants SET is_default = 1 WHERE id = 1 AND is_default <> 1")
+    )
+    # 初始管理员由 MT-P1 bootstrap（src/web/bootstrap.py）负责创建，本迁移不重复
+    # 实现凭证解析/哈希逻辑；下方 app_settings auth_* 旧键仅在 admin 已存在时删除。
+
+    # 3. 新表：tenant_settings / tenant_news_pushed / agent_config_overrides。
+    conn.execute(
+        text(
+            """
+CREATE TABLE IF NOT EXISTS tenant_settings (
+  tenant_id INTEGER NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  key TEXT NOT NULL,
+  value TEXT DEFAULT '',
+  description TEXT DEFAULT '',
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (tenant_id, key)
+)
+"""
+        )
+    )
+    conn.execute(
+        text(
+            """
+CREATE TABLE IF NOT EXISTS tenant_news_pushed (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id INTEGER NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  news_id INTEGER NOT NULL REFERENCES news_cache(id) ON DELETE CASCADE,
+  channel_id INTEGER,
+  pushed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT uq_tenant_news_pushed UNIQUE (tenant_id, news_id)
+)
+"""
+        )
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_tenant_news_pushed_news",
+        "CREATE INDEX ix_tenant_news_pushed_news ON tenant_news_pushed(news_id)",
+    )
+    # docs/26-J6：override 禁含 schedule（调度 cadence 全实例唯一，T17 单 job）。
+    conn.execute(
+        text(
+            """
+CREATE TABLE IF NOT EXISTS agent_config_overrides (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id INTEGER NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  agent_name VARCHAR NOT NULL,
+  enabled INTEGER,
+  execution_mode VARCHAR,
+  ai_model_id INTEGER REFERENCES ai_models(id) ON DELETE SET NULL,
+  notify_channel_ids JSON,
+  config JSON,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT uq_agent_override_tenant_name UNIQUE (tenant_id, agent_name)
+)
+"""
+        )
+    )
+
+    # 4. 31 张 A 类表加 tenant_id 裸列（NOT NULL DEFAULT 1，无 FK）+ 租户索引。
+    for table in MT_TENANT_TABLES_V120:
+        _add_column_if_missing(
+            conn,
+            table,
+            "tenant_id",
+            f"ALTER TABLE {table} ADD COLUMN tenant_id INTEGER NOT NULL DEFAULT 1",
+        )
+        _create_index_if_missing(
+            conn,
+            f"ix_{table}_tenant_id",
+            f"CREATE INDEX ix_{table}_tenant_id ON {table}(tenant_id)",
+        )
+
+    # 5. paper_trading 补 account_id（T9 前置，docs/21 §3.3）。
+    if _has_table(conn, "paper_trading_positions"):
+        _add_column_if_missing(
+            conn,
+            "paper_trading_positions",
+            "account_id",
+            "ALTER TABLE paper_trading_positions ADD COLUMN account_id INTEGER",
+        )
+    if _has_table(conn, "paper_trading_trades"):
+        _add_column_if_missing(
+            conn,
+            "paper_trading_trades",
+            "account_id",
+            "ALTER TABLE paper_trading_trades ADD COLUMN account_id INTEGER",
+        )
+    if _has_table(conn, "paper_trading_account"):
+        pending = 0
+        if _has_column(conn, "paper_trading_positions", "account_id"):
+            pending += int(
+                conn.execute(
+                    text(
+                        "SELECT COUNT(*) FROM paper_trading_positions WHERE account_id IS NULL"
+                    )
+                ).scalar()
+                or 0
+            )
+        if _has_column(conn, "paper_trading_trades", "account_id"):
+            pending += int(
+                conn.execute(
+                    text(
+                        "SELECT COUNT(*) FROM paper_trading_trades WHERE account_id IS NULL"
+                    )
+                ).scalar()
+                or 0
+            )
+        account_id = conn.execute(
+            text("SELECT MIN(id) FROM paper_trading_account")
+        ).scalar()
+        if account_id is None and pending > 0:
+            # 有持仓/流水但无账户：建默认账户承接回填（docs/21 §3.3 任务要求）。
+            conn.execute(
+                text(
+                    """
+INSERT INTO paper_trading_account (
+  initial_capital, current_capital, total_pnl, total_trades, winning_trades,
+  max_drawdown_pct, peak_capital, enabled, excluded_markets, market_allocations
+) VALUES (1000000.0, 1000000.0, 0.0, 0, 0, 0.0, 1000000.0, 1, '[]', '{}')
+"""
+                )
+            )
+        if _has_column(conn, "paper_trading_positions", "account_id"):
+            conn.execute(
+                text(
+                    """
+UPDATE paper_trading_positions
+SET account_id = (SELECT MIN(id) FROM paper_trading_account)
+WHERE account_id IS NULL
+"""
+                )
+            )
+        if _has_column(conn, "paper_trading_trades", "account_id"):
+            conn.execute(
+                text(
+                    """
+UPDATE paper_trading_trades
+SET account_id = (SELECT MIN(id) FROM paper_trading_account)
+WHERE account_id IS NULL
+"""
+                )
+            )
+        _create_index_if_missing(
+            conn,
+            "uq_paper_account_tenant",
+            "CREATE UNIQUE INDEX uq_paper_account_tenant ON paper_trading_account(tenant_id)",
+        )
+
+    # 6. notify_channels.is_shared（T21 托管渠道引用，docs/21 §3.4）。
+    _add_column_if_missing(
+        conn,
+        "notify_channels",
+        "is_shared",
+        "ALTER TABLE notify_channels ADD COLUMN is_shared INTEGER NOT NULL DEFAULT 0",
+    )
+
+    # 7. app_settings 三分（T20，docs/21 §7.1）。
+    #    a) 租户级键复制（不删）到 tenant_settings(tenant_id=1)。
+    keys_csv = ", ".join(f"'{k}'" for k in _MT_TENANT_SETTING_KEYS)
+    conn.execute(
+        text(
+            f"""
+INSERT OR IGNORE INTO tenant_settings (tenant_id, key, value, description)
+SELECT 1, key, value, description FROM app_settings
+WHERE key IN ({keys_csv})
+"""
+        )
+    )
+    #    b) 单租户回退 flag（实例级，默认 '1'）。
+    conn.execute(
+        text(
+            """
+INSERT INTO app_settings (key, value, description)
+SELECT 'single_tenant_mode', '1', '单租户直通模式（T20 回退 flag）：1=单租户'
+WHERE NOT EXISTS (SELECT 1 FROM app_settings WHERE key = 'single_tenant_mode')
+"""
+        )
+    )
+    #    c) auth_username/auth_password_hash 已搬入 users（MT-P1 bootstrap）→
+    #       仅在 admin 已存在时删除旧行；jwt_secret/http_proxy/panwatch_base_url
+    #       保留原位（实例级）。
+    conn.execute(
+        text(
+            """
+DELETE FROM app_settings
+WHERE key IN ('auth_username', 'auth_password_hash')
+  AND EXISTS (SELECT 1 FROM users WHERE role = 'admin')
+"""
+        )
+    )
+
+    # 8. notify_throttle 旧行 scope 回填（docs/23 §3.3，幂等 UPDATE；不重建 UQ）。
+    if _has_table(conn, "notify_throttle"):
+        conn.execute(
+            text(
+                """
+UPDATE notify_throttle
+SET stock_symbol = '__notify__:1:' || substr(stock_symbol, 12)
+WHERE stock_symbol LIKE '__notify__:%'
+  AND stock_symbol NOT LIKE '__notify__:1:%'
+"""
+            )
+        )
+        conn.execute(
+            text(
+                """
+UPDATE notify_throttle
+SET stock_symbol = '1:' || stock_symbol
+WHERE stock_symbol NOT LIKE '__notify__:%'
+  AND stock_symbol NOT LIKE '%:%'
+"""
+            )
+        )
+
+
+@dataclass(frozen=True)
+class _RebuildSpec:
+    """v121 单表 __new 重建规格（docs/21 §4 模板）。"""
+
+    table: str
+    create_sql: str  # CREATE TABLE {table}__new 完整 DDL
+    columns: tuple[str, ...]  # INSERT SELECT 显式列清单（含 tenant_id）
+    done_marker: str  # 已重建判定：规范化后的 DDL 子串
+    indexes: tuple[tuple[str, str], ...]  # (索引名, CREATE INDEX SQL) 全量清单
+
+
+def _normalize_sql(sql: str) -> str:
+    return " ".join(str(sql).split()).lower()
+
+
+def _table_ddl(conn: Connection, table: str) -> str:
+    row = conn.execute(
+        text("SELECT sql FROM sqlite_master WHERE type='table' AND name=:table"),
+        {"table": table},
+    ).first()
+    return str(row[0]) if row and row[0] else ""
+
+
+def _rebuild_insert_sql(spec: _RebuildSpec) -> str:
+    cols = ", ".join(spec.columns)
+    exprs = ", ".join(
+        "COALESCE(tenant_id, 1)" if col == "tenant_id" else col
+        for col in spec.columns
+    )
+    return (
+        f"INSERT INTO {spec.table}__new ({cols}) "
+        f"SELECT {exprs} FROM {spec.table}"
+    )
+
+
+def _apply_rebuild(conn: Connection, spec: _RebuildSpec) -> None:
+    """按 docs/21 §4 统一工序重建一张表（须在逐表事务内调用，幂等）。"""
+    table = spec.table
+    # 0. 清半成品（M3 断点重跑要求）。
+    conn.execute(text(f"DROP TABLE IF EXISTS {table}__new"))
+
+    if not _has_table(conn, table):
+        # 防御：基表不存在时直接以新 DDL 建正式表。
+        conn.execute(text(spec.create_sql.replace(f"{table}__new", table)))
+    elif _normalize_sql(spec.done_marker) not in _normalize_sql(
+        _table_ddl(conn, table)
+    ):
+        # 2. 建新表 → 3. 显式列拷贝 → 4. 行数对账 → 5. 换名。
+        conn.execute(text(spec.create_sql))
+        conn.execute(text(_rebuild_insert_sql(spec)))
+        old_count = int(
+            conn.execute(text(f"SELECT COUNT(*) FROM {table}")).scalar() or 0
+        )
+        new_count = int(
+            conn.execute(text(f"SELECT COUNT(*) FROM {table}__new")).scalar() or 0
+        )
+        if old_count != new_count:
+            raise RuntimeError(
+                f"v121 重建对账失败: {table} 旧 {old_count} 行 != 新 {new_count} 行"
+            )
+        conn.execute(text(f"DROP TABLE {table}"))
+        conn.execute(text(f"ALTER TABLE {table}__new RENAME TO {table}"))
+    # 6. 重建索引（全量声明，IF NOT EXISTS 幂等；旧表 DROP 会连带删索引）。
+    for name, sql in spec.indexes:
+        _create_index_if_missing(conn, name, sql)
+
+
+_V121_REBUILD_SPECS: tuple[_RebuildSpec, ...] = (
+    _RebuildSpec(
+        table="analysis_history",
+        create_sql="""
+CREATE TABLE analysis_history__new (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id INTEGER NOT NULL DEFAULT 1,
+  agent_name VARCHAR NOT NULL,
+  stock_symbol VARCHAR NOT NULL,
+  analysis_date VARCHAR NOT NULL,
+  title VARCHAR DEFAULT '',
+  content VARCHAR NOT NULL,
+  raw_data JSON DEFAULT '{}',
+  agent_kind_snapshot VARCHAR DEFAULT 'workflow',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT uq_agent_stock_date UNIQUE (tenant_id, agent_name, stock_symbol, analysis_date)
+)
+""",
+        columns=(
+            "id",
+            "tenant_id",
+            "agent_name",
+            "stock_symbol",
+            "analysis_date",
+            "title",
+            "content",
+            "raw_data",
+            "agent_kind_snapshot",
+            "created_at",
+            "updated_at",
+        ),
+        done_marker="UNIQUE (tenant_id, agent_name, stock_symbol, analysis_date)",
+        indexes=(
+            (
+                "ix_analysis_history_kind_date",
+                "CREATE INDEX ix_analysis_history_kind_date ON analysis_history(agent_kind_snapshot, analysis_date)",
+            ),
+            (
+                "ix_analysis_history_agent_updated",
+                "CREATE INDEX ix_analysis_history_agent_updated ON analysis_history(agent_name, updated_at)",
+            ),
+            (
+                "ix_analysis_history_tenant_id",
+                "CREATE INDEX ix_analysis_history_tenant_id ON analysis_history(tenant_id)",
+            ),
+        ),
+    ),
+    _RebuildSpec(
+        table="stock_context_snapshots",
+        create_sql="""
+CREATE TABLE stock_context_snapshots__new (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id INTEGER NOT NULL DEFAULT 1,
+  symbol VARCHAR NOT NULL,
+  market VARCHAR NOT NULL,
+  snapshot_date VARCHAR NOT NULL,
+  context_type VARCHAR NOT NULL,
+  payload JSON DEFAULT '{}',
+  quality JSON DEFAULT '{}',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT uq_stock_context_snapshot UNIQUE (tenant_id, symbol, market, snapshot_date, context_type)
+)
+""",
+        columns=(
+            "id",
+            "tenant_id",
+            "symbol",
+            "market",
+            "snapshot_date",
+            "context_type",
+            "payload",
+            "quality",
+            "created_at",
+        ),
+        done_marker="UNIQUE (tenant_id, symbol, market, snapshot_date, context_type)",
+        indexes=(
+            (
+                "ix_stock_context_symbol_date",
+                "CREATE INDEX ix_stock_context_symbol_date ON stock_context_snapshots(symbol, market, snapshot_date)",
+            ),
+            (
+                "ix_stock_context_snapshots_tenant_id",
+                "CREATE INDEX ix_stock_context_snapshots_tenant_id ON stock_context_snapshots(tenant_id)",
+            ),
+        ),
+    ),
+    _RebuildSpec(
+        table="news_topic_snapshots",
+        create_sql="""
+CREATE TABLE news_topic_snapshots__new (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id INTEGER NOT NULL DEFAULT 1,
+  snapshot_date VARCHAR NOT NULL,
+  window_days INTEGER NOT NULL DEFAULT 7,
+  symbols JSON DEFAULT '[]',
+  summary VARCHAR DEFAULT '',
+  topics JSON DEFAULT '[]',
+  sentiment VARCHAR DEFAULT 'neutral',
+  coverage JSON DEFAULT '{}',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT uq_news_topic_snapshot_date_window UNIQUE (tenant_id, snapshot_date, window_days)
+)
+""",
+        columns=(
+            "id",
+            "tenant_id",
+            "snapshot_date",
+            "window_days",
+            "symbols",
+            "summary",
+            "topics",
+            "sentiment",
+            "coverage",
+            "created_at",
+        ),
+        done_marker="UNIQUE (tenant_id, snapshot_date, window_days)",
+        indexes=(
+            (
+                "ix_news_topic_snapshot_date",
+                "CREATE INDEX ix_news_topic_snapshot_date ON news_topic_snapshots(snapshot_date)",
+            ),
+            (
+                "ix_news_topic_snapshots_tenant_id",
+                "CREATE INDEX ix_news_topic_snapshots_tenant_id ON news_topic_snapshots(tenant_id)",
+            ),
+        ),
+    ),
+    _RebuildSpec(
+        table="entry_candidates",
+        create_sql="""
+CREATE TABLE entry_candidates__new (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id INTEGER NOT NULL DEFAULT 1,
+  stock_symbol VARCHAR NOT NULL,
+  stock_market VARCHAR NOT NULL DEFAULT 'CN',
+  stock_name VARCHAR DEFAULT '',
+  snapshot_date VARCHAR NOT NULL,
+  status VARCHAR DEFAULT 'active',
+  score FLOAT NOT NULL DEFAULT 0,
+  confidence FLOAT,
+  action VARCHAR NOT NULL DEFAULT 'watch',
+  action_label VARCHAR NOT NULL DEFAULT '观望',
+  signal VARCHAR DEFAULT '',
+  reason VARCHAR DEFAULT '',
+  candidate_source VARCHAR NOT NULL DEFAULT 'watchlist',
+  strategy_tags JSON DEFAULT '[]',
+  is_holding_snapshot BOOLEAN DEFAULT 0,
+  plan_quality INTEGER DEFAULT 0,
+  entry_low FLOAT,
+  entry_high FLOAT,
+  stop_loss FLOAT,
+  target_price FLOAT,
+  invalidation VARCHAR DEFAULT '',
+  source_agent VARCHAR DEFAULT '',
+  source_suggestion_id INTEGER,
+  source_trace_id VARCHAR DEFAULT '',
+  evidence JSON DEFAULT '[]',
+  "plan" JSON DEFAULT '{}',
+  meta JSON DEFAULT '{}',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT uq_entry_candidate_stock_date UNIQUE (tenant_id, stock_symbol, stock_market, snapshot_date)
+)
+""",
+        columns=(
+            "id",
+            "tenant_id",
+            "stock_symbol",
+            "stock_market",
+            "stock_name",
+            "snapshot_date",
+            "status",
+            "score",
+            "confidence",
+            "action",
+            "action_label",
+            "signal",
+            "reason",
+            "candidate_source",
+            "strategy_tags",
+            "is_holding_snapshot",
+            "plan_quality",
+            "entry_low",
+            "entry_high",
+            "stop_loss",
+            "target_price",
+            "invalidation",
+            "source_agent",
+            "source_suggestion_id",
+            "source_trace_id",
+            "evidence",
+            '"plan"',
+            "meta",
+            "created_at",
+            "updated_at",
+        ),
+        done_marker="UNIQUE (tenant_id, stock_symbol, stock_market, snapshot_date)",
+        indexes=(
+            (
+                "ix_entry_candidate_score_date",
+                "CREATE INDEX ix_entry_candidate_score_date ON entry_candidates(snapshot_date, score)",
+            ),
+            (
+                "ix_entry_candidate_status_updated",
+                "CREATE INDEX ix_entry_candidate_status_updated ON entry_candidates(status, updated_at)",
+            ),
+            (
+                "ix_entry_candidate_source_score",
+                "CREATE INDEX ix_entry_candidate_source_score ON entry_candidates(candidate_source, score)",
+            ),
+            (
+                "ix_entry_candidate_market_status",
+                "CREATE INDEX ix_entry_candidate_market_status ON entry_candidates(stock_market, status)",
+            ),
+            (
+                "ix_entry_candidates_tenant_id",
+                "CREATE INDEX ix_entry_candidates_tenant_id ON entry_candidates(tenant_id)",
+            ),
+        ),
+    ),
+    _RebuildSpec(
+        table="stocks",
+        create_sql="""
+CREATE TABLE stocks__new (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id INTEGER NOT NULL DEFAULT 1,
+  symbol VARCHAR NOT NULL,
+  name VARCHAR NOT NULL,
+  market VARCHAR NOT NULL,
+  cost_price FLOAT,
+  quantity INTEGER,
+  invested_amount FLOAT,
+  sort_order INTEGER DEFAULT 0,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT uq_stocks_tenant_symbol_market UNIQUE (tenant_id, symbol, market)
+)
+""",
+        columns=(
+            "id",
+            "tenant_id",
+            "symbol",
+            "name",
+            "market",
+            "cost_price",
+            "quantity",
+            "invested_amount",
+            "sort_order",
+            "created_at",
+            "updated_at",
+        ),
+        done_marker="uq_stocks_tenant_symbol_market",
+        indexes=(
+            (
+                "ix_stocks_tenant_id",
+                "CREATE INDEX ix_stocks_tenant_id ON stocks(tenant_id)",
+            ),
+        ),
+    ),
+    _RebuildSpec(
+        table="paper_trading_positions",
+        create_sql="""
+CREATE TABLE paper_trading_positions__new (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id INTEGER NOT NULL DEFAULT 1,
+  account_id INTEGER NOT NULL REFERENCES paper_trading_account(id) ON DELETE CASCADE,
+  stock_symbol VARCHAR NOT NULL,
+  stock_market VARCHAR NOT NULL DEFAULT 'CN',
+  stock_name VARCHAR DEFAULT '',
+  quantity INTEGER NOT NULL DEFAULT 100,
+  entry_price FLOAT NOT NULL,
+  stop_loss FLOAT,
+  target_price FLOAT,
+  current_price FLOAT,
+  highest_price FLOAT,
+  unrealized_pnl FLOAT NOT NULL DEFAULT 0.0,
+  status VARCHAR NOT NULL DEFAULT 'open',
+  signal_run_id INTEGER,
+  signal_snapshot_date VARCHAR DEFAULT '',
+  signal_action VARCHAR DEFAULT '',
+  strategy_code VARCHAR DEFAULT '',
+  opened_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  closed_at DATETIME,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+""",
+        columns=(
+            "id",
+            "tenant_id",
+            "account_id",
+            "stock_symbol",
+            "stock_market",
+            "stock_name",
+            "quantity",
+            "entry_price",
+            "stop_loss",
+            "target_price",
+            "current_price",
+            "highest_price",
+            "unrealized_pnl",
+            "status",
+            "signal_run_id",
+            "signal_snapshot_date",
+            "signal_action",
+            "strategy_code",
+            "opened_at",
+            "closed_at",
+            "updated_at",
+        ),
+        done_marker="REFERENCES paper_trading_account",
+        indexes=(
+            (
+                "ix_paper_pos_status",
+                "CREATE INDEX ix_paper_pos_status ON paper_trading_positions(status)",
+            ),
+            (
+                "ix_paper_pos_symbol_market",
+                "CREATE INDEX ix_paper_pos_symbol_market ON paper_trading_positions(stock_symbol, stock_market)",
+            ),
+            (
+                "ix_paper_pos_account_status",
+                "CREATE INDEX ix_paper_pos_account_status ON paper_trading_positions(account_id, status)",
+            ),
+            (
+                "ix_paper_trading_positions_tenant_id",
+                "CREATE INDEX ix_paper_trading_positions_tenant_id ON paper_trading_positions(tenant_id)",
+            ),
+        ),
+    ),
+    _RebuildSpec(
+        table="paper_trading_trades",
+        create_sql="""
+CREATE TABLE paper_trading_trades__new (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id INTEGER NOT NULL DEFAULT 1,
+  account_id INTEGER NOT NULL REFERENCES paper_trading_account(id) ON DELETE CASCADE,
+  stock_symbol VARCHAR NOT NULL,
+  stock_market VARCHAR NOT NULL DEFAULT 'CN',
+  stock_name VARCHAR DEFAULT '',
+  quantity INTEGER NOT NULL DEFAULT 100,
+  entry_price FLOAT NOT NULL,
+  exit_price FLOAT NOT NULL,
+  pnl FLOAT NOT NULL DEFAULT 0.0,
+  pnl_pct FLOAT NOT NULL DEFAULT 0.0,
+  exit_reason VARCHAR NOT NULL DEFAULT '',
+  signal_run_id INTEGER,
+  signal_snapshot_date VARCHAR DEFAULT '',
+  strategy_code VARCHAR DEFAULT '',
+  holding_days INTEGER DEFAULT 0,
+  opened_at DATETIME,
+  closed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  meta JSON DEFAULT '{}'
+)
+""",
+        columns=(
+            "id",
+            "tenant_id",
+            "account_id",
+            "stock_symbol",
+            "stock_market",
+            "stock_name",
+            "quantity",
+            "entry_price",
+            "exit_price",
+            "pnl",
+            "pnl_pct",
+            "exit_reason",
+            "signal_run_id",
+            "signal_snapshot_date",
+            "strategy_code",
+            "holding_days",
+            "opened_at",
+            "closed_at",
+            "meta",
+        ),
+        done_marker="REFERENCES paper_trading_account",
+        indexes=(
+            (
+                "ix_paper_trade_closed",
+                "CREATE INDEX ix_paper_trade_closed ON paper_trading_trades(closed_at)",
+            ),
+            (
+                "ix_paper_trade_symbol",
+                "CREATE INDEX ix_paper_trade_symbol ON paper_trading_trades(stock_symbol, stock_market)",
+            ),
+            (
+                "ix_paper_trade_account_closed",
+                "CREATE INDEX ix_paper_trade_account_closed ON paper_trading_trades(account_id, closed_at)",
+            ),
+            (
+                "ix_paper_trading_trades_tenant_id",
+                "CREATE INDEX ix_paper_trading_trades_tenant_id ON paper_trading_trades(tenant_id)",
+            ),
+        ),
+    ),
+)
+
+
+def _m121_tenant_constraint_rebuild(conn: Connection) -> None:
+    """v121：7 张表 __new 约束重建（docs/21 §4）。
+
+    本迁移以 transactional=False 注册（独立连接执行）：PRAGMA foreign_keys
+    在事务内是 no-op（docs/17 R4），必须先关闭再重建，否则 DROP 父表
+    （stocks/entry_candidates）会级联误删子表；每表独立事务，断点重跑安全。
+    """
+    conn.execute(text("PRAGMA foreign_keys=OFF"))
+    conn.commit()
+    try:
+        for spec in _V121_REBUILD_SPECS:
+            with conn.begin():
+                _apply_rebuild(conn, spec)
+    finally:
+        conn.execute(text("PRAGMA foreign_keys=ON"))
+        conn.commit()
+
+
+#: v122 子行 tenant 仅父派生不变量（docs/21 §5.2；末条为 docs/26-J2 父派生补充）。
+_V122_INVARIANTS: tuple[tuple[str, str], ...] = (
+    (
+        "positions.tenant != accounts.tenant",
+        "SELECT COUNT(*) FROM positions p JOIN accounts a ON p.account_id=a.id "
+        "WHERE p.tenant_id <> a.tenant_id",
+    ),
+    (
+        "position_trades.tenant != positions.tenant",
+        "SELECT COUNT(*) FROM position_trades t JOIN positions p ON t.position_id=p.id "
+        "WHERE t.tenant_id <> p.tenant_id",
+    ),
+    (
+        "positions.tenant != stocks.tenant",
+        "SELECT COUNT(*) FROM positions p JOIN stocks s ON p.stock_id=s.id "
+        "WHERE p.tenant_id <> s.tenant_id",
+    ),
+    (
+        "stock_agents.tenant != stocks.tenant",
+        "SELECT COUNT(*) FROM stock_agents x JOIN stocks s ON x.stock_id=s.id "
+        "WHERE x.tenant_id <> s.tenant_id",
+    ),
+    (
+        "price_alert_rules.tenant != stocks.tenant",
+        "SELECT COUNT(*) FROM price_alert_rules r JOIN stocks s ON r.stock_id=s.id "
+        "WHERE r.tenant_id <> s.tenant_id",
+    ),
+    (
+        "price_alert_hits.tenant != price_alert_rules.tenant",
+        "SELECT COUNT(*) FROM price_alert_hits h JOIN price_alert_rules r ON h.rule_id=r.id "
+        "WHERE h.tenant_id <> r.tenant_id",
+    ),
+    (
+        "stock_playbooks.tenant != stocks.tenant",
+        "SELECT COUNT(*) FROM stock_playbooks b JOIN stocks s ON b.stock_id=s.id "
+        "WHERE b.tenant_id <> s.tenant_id",
+    ),
+    (
+        "ai_models.tenant != ai_services.tenant",
+        "SELECT COUNT(*) FROM ai_models m JOIN ai_services s ON m.service_id=s.id "
+        "WHERE m.tenant_id <> s.tenant_id",
+    ),
+    (
+        "entry_candidate_outcomes.tenant != entry_candidates.tenant",
+        "SELECT COUNT(*) FROM entry_candidate_outcomes o JOIN entry_candidates c ON o.candidate_id=c.id "
+        "WHERE o.tenant_id <> c.tenant_id",
+    ),
+    (
+        "suggestion_feedback.tenant != stock_suggestions.tenant",
+        "SELECT COUNT(*) FROM suggestion_feedback f JOIN stock_suggestions s ON f.suggestion_id=s.id "
+        "WHERE f.tenant_id <> s.tenant_id",
+    ),
+    (
+        "paper_trading_positions.tenant != paper_trading_account.tenant",
+        "SELECT COUNT(*) FROM paper_trading_positions p JOIN paper_trading_account a ON p.account_id=a.id "
+        "WHERE p.tenant_id <> a.tenant_id",
+    ),
+    (
+        "paper_trading_trades.tenant != paper_trading_account.tenant",
+        "SELECT COUNT(*) FROM paper_trading_trades t JOIN paper_trading_account a ON t.account_id=a.id "
+        "WHERE t.tenant_id <> a.tenant_id",
+    ),
+    (
+        "chat_messages.tenant != chat_conversations.tenant",
+        "SELECT COUNT(*) FROM chat_messages m JOIN chat_conversations c ON m.conversation_id=c.id "
+        "WHERE m.tenant_id <> c.tenant_id",
+    ),
+    (
+        "users.tenant_id 指向不存在租户",
+        "SELECT COUNT(*) FROM users u LEFT JOIN tenants t ON u.tenant_id=t.id "
+        "WHERE t.id IS NULL",
+    ),
+    (
+        "strategy_outcomes.tenant != strategy_signal_runs.tenant",
+        "SELECT COUNT(*) FROM strategy_outcomes o JOIN strategy_signal_runs r ON o.signal_run_id=r.id "
+        "WHERE o.tenant_id <> r.tenant_id",
+    ),
+)
+
+
+def _m122_tenant_reconciliation(conn: Connection) -> None:
+    """v122：对账（docs/21 §5）。独立连接执行，任一检查失配即 raise 阻断启动。
+
+    数据锚点（2150 股@112.572 / 5 笔流水 / playbook id=1）为生产库验收锚点
+    （C5/M7）：仅在对应基表非空（即升级自含该数据的存量库）时强制核对，
+    全新/测试库自动跳过；schema 级不变量（FK、tenant 归因、孤儿租户）无条件强制。
+    """
+    failures: list[str] = []
+    engine = conn.engine
+    with engine.connect() as chk:
+        # 5.1 外键一致性
+        fk_rows = chk.execute(text("PRAGMA foreign_key_check")).fetchall()
+        if fk_rows:
+            failures.append(f"foreign_key_check 返回 {len(fk_rows)} 行: {fk_rows[:5]}")
+
+        # 5.2 子行 tenant 仅父派生不变量
+        for label, sql in _V122_INVARIANTS:
+            count = int(chk.execute(text(sql)).scalar() or 0)
+            if count:
+                failures.append(f"不变量违背[{label}]: {count} 行")
+
+        # 锚点 4：31 张 A 类表 tenant_id 无 NULL 且无孤儿租户
+        # （哨兵表允许 tenant_id=0，docs/26-J2/J3/J11）。
+        for table in MT_TENANT_TABLES_V120:
+            if not _has_table(chk, table):
+                continue
+            nulls = int(
+                chk.execute(
+                    text(f"SELECT COUNT(*) FROM {table} WHERE tenant_id IS NULL")
+                ).scalar()
+                or 0
+            )
+            if nulls:
+                failures.append(f"{table}: {nulls} 行 tenant_id IS NULL")
+            if table in MT_SENTINEL_ZERO_TABLES:
+                orphans = int(
+                    chk.execute(
+                        text(
+                            f"SELECT COUNT(*) FROM {table} "
+                            "WHERE tenant_id <> 0 "
+                            "AND tenant_id NOT IN (SELECT id FROM tenants)"
+                        )
+                    ).scalar()
+                    or 0
+                )
+            else:
+                orphans = int(
+                    chk.execute(
+                        text(
+                            f"SELECT COUNT(*) FROM {table} "
+                            "WHERE tenant_id NOT IN (SELECT id FROM tenants)"
+                        )
+                    ).scalar()
+                    or 0
+                )
+            if orphans:
+                failures.append(f"{table}: {orphans} 行 tenant_id 无对应租户")
+
+        # 5.3 一致性锚点（C5/M7，存量库强制、全新库跳过）
+        if int(chk.execute(text("SELECT COUNT(*) FROM positions")).scalar() or 0):
+            anchor1 = int(
+                chk.execute(
+                    text(
+                        "SELECT COUNT(*) FROM positions "
+                        "WHERE quantity = 2150 AND ABS(cost_price - 112.572) < 0.001"
+                    )
+                ).scalar()
+                or 0
+            )
+            if anchor1 < 1:
+                failures.append("锚点1: 默认账户 2150 股@112.572 持仓不存在")
+            else:
+                anchor2 = int(
+                    chk.execute(
+                        text(
+                            "SELECT COUNT(*) FROM position_trades t "
+                            "JOIN positions p ON t.position_id = p.id "
+                            "WHERE p.quantity = 2150 "
+                            "AND ABS(p.cost_price - 112.572) < 0.001"
+                        )
+                    ).scalar()
+                    or 0
+                )
+                if anchor2 != 5:
+                    failures.append(f"锚点2: 锚点持仓流水 {anchor2} 笔 != 5 笔")
+        playbook = chk.execute(
+            text("SELECT is_active FROM stock_playbooks WHERE id = 1")
+        ).first()
+        if playbook is not None and int(playbook[0] or 0) != 1:
+            failures.append("锚点3: playbook id=1 非激活态")
+        if not int(
+            chk.execute(text("SELECT COUNT(*) FROM tenants WHERE id = 1")).scalar()
+            or 0
+        ):
+            failures.append("锚点5: tenants 缺默认租户 id=1")
+        if int(chk.execute(text("SELECT COUNT(*) FROM users")).scalar() or 0):
+            admins = int(
+                chk.execute(
+                    text(
+                        "SELECT COUNT(*) FROM users WHERE role = 'admin' AND tenant_id = 1"
+                    )
+                ).scalar()
+                or 0
+            )
+            if admins < 1:
+                failures.append("锚点5: users 无 tenant_id=1 的 admin")
+
+    if failures:
+        raise RuntimeError("v122 多租户对账失败: " + "；".join(failures))
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(101, "agent_config_kind_and_visibility", _m101_agent_config_kind),
     Migration(102, "backfill_agent_kind_data", _m102_backfill_agent_kind),
@@ -1615,6 +2648,14 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(117, "chat_initial_context", _m117_chat_initial_context),
     Migration(118, "paper_trading_market_allocations", _m118_paper_trading_market_allocations),
     Migration(119, "price_alert_rule_playbook_id", _m119_price_alert_rule_playbook_id),
+    Migration(120, "tenant_foundation_columns_backfill", _m120_tenant_foundation),
+    Migration(
+        121,
+        "tenant_constraint_rebuild",
+        _m121_tenant_constraint_rebuild,
+        transactional=False,
+    ),
+    Migration(122, "tenant_reconciliation", _m122_tenant_reconciliation),
 )
 
 
@@ -1650,6 +2691,9 @@ def run_versioned_migrations(engine: Engine) -> None:
         _ensure_schema_table(conn)
 
     for m in MIGRATIONS:
+        if not m.transactional:
+            _run_nontransactional_migration(engine, m)
+            continue
         with engine.begin() as conn:
             _ensure_schema_table(conn)
             rec = _get_applied(conn, m.version)
@@ -1705,3 +2749,72 @@ WHERE version = :version
                 )
                 logger.exception("Migration v%s failed: %s", m.version, m.name)
                 raise
+
+
+def _run_nontransactional_migration(engine: Engine, m: Migration) -> None:
+    """非事务型迁移入口（v121+ 的 __new 重建）。
+
+    runner 需要在连接级、事务外切换 PRAGMA foreign_keys（docs/17 R4），因此
+    不能用 engine.begin() 包裹；账本 upsert 与成败落库各自独立提交，runner
+    内部按表自建事务，崩溃后按 checksum/success 记账重跑，断点安全。
+    """
+    with engine.connect() as conn:
+        _ensure_schema_table(conn)
+        conn.commit()
+        rec = _get_applied(conn, m.version)
+        if rec and rec[2] == 1 and rec[1] == m.checksum:
+            return
+
+        conn.execute(
+            text(
+                """
+INSERT INTO schema_migrations(version, name, checksum, success, error)
+VALUES(:version, :name, :checksum, 0, '')
+ON CONFLICT(version) DO UPDATE SET
+  name = excluded.name,
+  checksum = excluded.checksum,
+  success = 0,
+  error = ''
+"""
+            ),
+            {
+                "version": m.version,
+                "name": m.name,
+                "checksum": m.checksum,
+            },
+        )
+        conn.commit()
+        logger.info("Applying migration v%s: %s", m.version, m.name)
+
+        try:
+            m.runner(conn)
+            conn.execute(
+                text(
+                    """
+UPDATE schema_migrations
+SET success = 1,
+    error = '',
+    applied_at = CURRENT_TIMESTAMP
+WHERE version = :version
+"""
+                ),
+                {"version": m.version},
+            )
+            conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            conn.execute(
+                text(
+                    """
+UPDATE schema_migrations
+SET success = 0,
+    error = :error,
+    applied_at = CURRENT_TIMESTAMP
+WHERE version = :version
+"""
+                ),
+                {"version": m.version, "error": str(exc)[:2000]},
+            )
+            conn.commit()
+            logger.exception("Migration v%s failed: %s", m.version, m.name)
+            raise

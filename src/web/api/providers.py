@@ -8,6 +8,28 @@ from src.core.ai_client import AIClient
 
 router = APIRouter()
 
+# ── 排他 is_default 全表 update 租户收口（MT-P2，docs/22 §2.x / docs/26-J11）──
+# do_orm_execute 已对 SessionLocal 全局生效，会给 ORM bulk UPDATE 注入 tenant
+# 谓词；此处叠加显式 tenant 条件做双保险。模型尚未映射 tenant_id（迁移双轨
+# 窗口期）或无 ctx 时不加条件，保持单租户行为等价。
+try:  # 防御：tenant_context 不可用时退化为不加条件（等价单租户）
+    from src.web.tenant_context import current_tenant as _current_tenant
+except Exception:  # pragma: no cover - 防御性兜底
+    _current_tenant = None  # type: ignore[assignment]
+
+
+def _reset_default_models(db: Session) -> None:
+    """复位全部模型的 is_default（排他默认模型前置步骤），按租户收口。"""
+    query = db.query(AIModel)
+    if _current_tenant is not None and hasattr(AIModel, "tenant_id"):
+        try:
+            ctx = _current_tenant()
+        except Exception:  # pragma: no cover - 防御性兜底
+            ctx = None
+        if ctx is not None:
+            query = query.filter(AIModel.tenant_id == ctx.tenant_id)
+    query.update({"is_default": False})
+
 
 # --- Service ---
 
@@ -135,7 +157,7 @@ def create_model(body: ModelCreate, db: Session = Depends(get_db)):
         raise HTTPException(400, "AI 服务商不存在")
 
     if body.is_default:
-        db.query(AIModel).update({"is_default": False})
+        _reset_default_models(db)
 
     data = body.model_dump()
     if not data["name"]:
@@ -155,7 +177,7 @@ def update_model(model_id: int, body: ModelUpdate, db: Session = Depends(get_db)
 
     data = body.model_dump(exclude_unset=True)
     if data.get("is_default"):
-        db.query(AIModel).update({"is_default": False})
+        _reset_default_models(db)
 
     for key, value in data.items():
         setattr(model, key, value)
@@ -228,7 +250,7 @@ def batch_add_models(service_id: int, body: BatchModelCreate, db: Session = Depe
         if not item.model or item.model in existing:
             continue
         if item.is_default:
-            db.query(AIModel).update({"is_default": False})
+            _reset_default_models(db)
         db.add(AIModel(
             name=item.name or item.model,
             service_id=service_id,
