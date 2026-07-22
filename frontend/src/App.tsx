@@ -100,7 +100,7 @@ function App() {
         if (!shouldOpen) return
         const dismissed = localStorage.getItem('panwatch_upgrade_dismissed_version') || ''
         if (dismissed === latest) return
-        setUpgradeInfo({ latest, url: String(res?.release_url || 'https://github.com/sunxiao0721/PanWatch/releases') })
+        setUpgradeInfo({ latest, url: String(res?.release_url || 'https://github.com/tntchen/PanWatch/releases') })
         setUpgradeOpen(true)
       })
       .catch(() => {})
@@ -293,7 +293,7 @@ function App() {
             </Button>
             <Button
               onClick={() => {
-                const url = upgradeInfo?.url || 'https://github.com/sunxiao0721/PanWatch/releases'
+                const url = upgradeInfo?.url || 'https://github.com/tntchen/PanWatch/releases'
                 window.open(url, '_blank', 'noopener,noreferrer')
               }}
             >

@@ -23,7 +23,7 @@ on:
         default: 'linux/amd64,linux/arm64'
 
 env:
-  IMAGE_NAME: sunxiao0721/panwatch
+  IMAGE_NAME: chentnt/panwatch
 
 jobs:
   docker:

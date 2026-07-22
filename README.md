@@ -3,7 +3,7 @@
 **自托管 AI 盯盘助手 · 集成 [TradingAgents](https://github.com/TauricResearch/TradingAgents) 多 Agent 投资决策** — A 股 / 港股 / 美股实时监控、持仓管理、智能分析、全渠道推送
 
 [![GitHub stars](https://img.shields.io/github/stars/TNT-Likely/PanWatch?style=flat&logo=github&color=yellow)](https://github.com/TNT-Likely/PanWatch/stargazers)
-[![Docker Pulls](https://img.shields.io/docker/pulls/sunxiao0721/panwatch?logo=docker&label=docker%20pulls&color=2496ED)](https://hub.docker.com/r/sunxiao0721/panwatch)
+[![Docker Pulls](https://img.shields.io/docker/pulls/chentnt/panwatch?logo=docker&label=docker%20pulls&color=2496ED)](https://hub.docker.com/r/chentnt/panwatch)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Last commit](https://img.shields.io/github/last-commit/TNT-Likely/PanWatch)](https://github.com/TNT-Likely/PanWatch/commits/main)
 [![PWA](https://img.shields.io/badge/PWA-installable-5A0FC8?logo=pwa&logoColor=white)](https://github.com/TNT-Likely/PanWatch)
@@ -105,7 +105,7 @@ docker run -d \
   --name panwatch \
   -p 8000:8000 \
   -v panwatch_data:/app/data \
-  sunxiao0721/panwatch:latest
+  chentnt/panwatch:latest
 ```
 
 访问 `http://localhost:8000`，首次使用设置账号密码即可。
@@ -121,7 +121,7 @@ docker run -d \
 version: '3.8'
 services:
   panwatch:
-    image: sunxiao0721/panwatch:latest
+    image: chentnt/panwatch:latest
     container_name: panwatch
     ports:
       - "8000:8000"
@@ -203,8 +203,8 @@ cd frontend && pnpm install && pnpm dev       # 前端 :5183
 本项目内置 GitHub Actions 发布流程：
 
 - 打 tag（例如 `0.2.3`）会自动构建并推送 Docker 镜像
-  - `sunxiao0721/panwatch:0.2.3`
-  - `sunxiao0721/panwatch:latest`
+  - `chentnt/panwatch:0.2.3`
+  - `chentnt/panwatch:latest`
 - 也支持在 GitHub Actions 里手动触发（workflow_dispatch）指定版本号
 
 需要在仓库 Secrets 中配置：

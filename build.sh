@@ -9,7 +9,7 @@ NC='\033[0m' # No Color
 
 # 默认值
 VERSION=${1:-"latest"}
-IMAGE_NAME="sunxiao0721/panwatch"
+IMAGE_NAME="chentnt/panwatch"
 
 echo -e "${GREEN}🚀 PanWatch 构建脚本${NC}"
 echo -e "版本: ${YELLOW}${VERSION}${NC}"

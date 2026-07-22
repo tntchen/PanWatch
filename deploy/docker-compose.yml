@@ -1,0 +1,24 @@
+services:
+  panwatch:
+    image: chentnt/panwatch:latest
+    container_name: panwatch
+    ports:
+      - "8000:8000"
+    volumes:
+      - panwatch_data:/app/data
+    env_file: .env
+    restart: unless-stopped
+
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: watchtower
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      WATCHTOWER_POLL_INTERVAL: 300
+      WATCHTOWER_CLEANUP: "true"
+    command: panwatch
+    restart: unless-stopped
+
+volumes:
+  panwatch_data:
