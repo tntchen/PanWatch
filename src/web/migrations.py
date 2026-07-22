@@ -6,6 +6,7 @@ import hashlib
 import inspect
 import logging
 import json
+import os
 from dataclasses import dataclass
 from datetime import date
 from typing import Callable
@@ -2575,38 +2576,43 @@ def _m122_tenant_reconciliation(conn: Connection) -> None:
             if orphans:
                 failures.append(f"{table}: {orphans} 行 tenant_id 无对应租户")
 
-        # 5.3 一致性锚点（C5/M7，存量库强制、全新库跳过）
-        if int(chk.execute(text("SELECT COUNT(*) FROM positions")).scalar() or 0):
-            anchor1 = int(
-                chk.execute(
-                    text(
-                        "SELECT COUNT(*) FROM positions "
-                        "WHERE quantity = 2150 AND ABS(cost_price - 112.572) < 0.001"
-                    )
-                ).scalar()
-                or 0
-            )
-            if anchor1 < 1:
-                failures.append("锚点1: 默认账户 2150 股@112.572 持仓不存在")
-            else:
-                anchor2 = int(
+        # 5.3 一致性锚点（C5/M7）：针对特定开发/验收库的数据锚点（2150 股@112.572
+        # / 5 笔流水 / playbook id=1 激活）。此类锚点与具体环境数据绑定，不能钉死在
+        # 通用迁移里——否则任何数据不同的存量生产库都会被拒绝启动（2026-07-22 NAS
+        # 部署 0.4.0 即因此失败）。默认关闭，仅显式设 MT_RECON_ANCHORS=1 时执行；
+        # schema 级不变量（上方 FK / tenant 归因 / 孤儿租户）始终无条件强制。
+        if os.getenv("MT_RECON_ANCHORS") == "1":
+            if int(chk.execute(text("SELECT COUNT(*) FROM positions")).scalar() or 0):
+                anchor1 = int(
                     chk.execute(
                         text(
-                            "SELECT COUNT(*) FROM position_trades t "
-                            "JOIN positions p ON t.position_id = p.id "
-                            "WHERE p.quantity = 2150 "
-                            "AND ABS(p.cost_price - 112.572) < 0.001"
+                            "SELECT COUNT(*) FROM positions "
+                            "WHERE quantity = 2150 AND ABS(cost_price - 112.572) < 0.001"
                         )
                     ).scalar()
                     or 0
                 )
-                if anchor2 != 5:
-                    failures.append(f"锚点2: 锚点持仓流水 {anchor2} 笔 != 5 笔")
-        playbook = chk.execute(
-            text("SELECT is_active FROM stock_playbooks WHERE id = 1")
-        ).first()
-        if playbook is not None and int(playbook[0] or 0) != 1:
-            failures.append("锚点3: playbook id=1 非激活态")
+                if anchor1 < 1:
+                    failures.append("锚点1: 默认账户 2150 股@112.572 持仓不存在")
+                else:
+                    anchor2 = int(
+                        chk.execute(
+                            text(
+                                "SELECT COUNT(*) FROM position_trades t "
+                                "JOIN positions p ON t.position_id = p.id "
+                                "WHERE p.quantity = 2150 "
+                                "AND ABS(p.cost_price - 112.572) < 0.001"
+                            )
+                        ).scalar()
+                        or 0
+                    )
+                    if anchor2 != 5:
+                        failures.append(f"锚点2: 锚点持仓流水 {anchor2} 笔 != 5 笔")
+            playbook = chk.execute(
+                text("SELECT is_active FROM stock_playbooks WHERE id = 1")
+            ).first()
+            if playbook is not None and int(playbook[0] or 0) != 1:
+                failures.append("锚点3: playbook id=1 非激活态")
         if not int(
             chk.execute(text("SELECT COUNT(*) FROM tenants WHERE id = 1")).scalar()
             or 0
