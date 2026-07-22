@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Iterator
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from src.collectors.capital_flow_collector import CapitalFlowCollector
@@ -20,6 +22,12 @@ from src.core.marketdata_client import md_quote_rows
 from src.models.market import MarketCode, MARKETS
 from src.web.database import SessionLocal
 from src.web.models import NotifyChannel, PriceAlertHit, PriceAlertRule, Stock
+from src.web.tenant_context import (
+    DEFAULT_TENANT_ID,
+    reset_current_tenant,
+    set_current_tenant,
+    single_tenant_mode,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +75,26 @@ def _json_get(obj: dict, key: str, default=None):
         return obj.get(key, default)
     except Exception:
         return default
+
+
+def _rule_tenant_id(rule: PriceAlertRule) -> int:
+    """规则行归属租户（T21 路由依据；缺省按默认租户 1）。"""
+    return int(getattr(rule, "tenant_id", None) or DEFAULT_TENANT_ID)
+
+
+@contextmanager
+def _unscoped_tenant() -> Iterator[None]:
+    """临时清空租户 ctx：用于「本租户 + 托管共享」可见集查询。
+
+    do_orm_execute 自动过滤只能表达 tenant_id == ctx，表达不了
+    ``tenant_id == ctx OR is_shared`` 的共享语义；窗口内查询必须自带显式
+    租户谓词（调用方负责）。
+    """
+    token = set_current_tenant(None)
+    try:
+        yield
+    finally:
+        reset_current_tenant(token)
 
 
 def _op_eval(left: float | None, op: str, right: Any) -> bool:
@@ -396,30 +424,59 @@ class PriceAlertEngine:
         return True, "ok"
 
     def _resolve_channels(self, db: Session, rule: PriceAlertRule) -> list[NotifyChannel]:
-        ids = rule.notify_channel_ids or []
-        if ids:
-            return (
-                db.query(NotifyChannel)
-                .filter(NotifyChannel.enabled == True, NotifyChannel.id.in_(ids))
-                .all()
-            )
-        return (
-            db.query(NotifyChannel)
-            .filter(NotifyChannel.enabled == True, NotifyChannel.is_default == True)
-            .all()
-        )
+        """按规则行的 tenant_id 路由通知渠道（T21 / docs/23 §6.3）。
 
-    def _build_notify_policy(self, db: Session | None) -> NotifyPolicy:
-        """构建统一 NotifyPolicy（静默时段等），Settings 默认值 + app_settings 覆盖。"""
+        单租户直通模式：行为与原实现完全一致（全部启用渠道）。
+        多租户：可见集 = 本租户渠道 + 管理员托管共享渠道（is_shared）。
+        """
+        ids = rule.notify_channel_ids or []
+        tenant_id = _rule_tenant_id(rule)
+        if ids:
+            query = db.query(NotifyChannel).filter(
+                NotifyChannel.enabled == True, NotifyChannel.id.in_(ids)
+            )
+        else:
+            query = db.query(NotifyChannel).filter(
+                NotifyChannel.enabled == True, NotifyChannel.is_default == True
+            )
+        if single_tenant_mode():
+            return query.all()
+        with _unscoped_tenant():
+            return query.filter(
+                or_(
+                    NotifyChannel.tenant_id == tenant_id,
+                    NotifyChannel.is_shared == True,
+                )
+            ).all()
+
+    def _build_notify_policy(
+        self, db: Session | None, tenant_id: int | None = None
+    ) -> NotifyPolicy:
+        """构建统一 NotifyPolicy（静默时段等），Settings 默认值 + 配置覆盖。
+
+        多租户且指定 tenant_id 时优先读租户级 tenant_settings（T20 三分），
+        缺省回退实例级 app_settings；单租户直通模式只读 app_settings（原行为）。
+        """
         settings = Settings()
         quiet_hours = settings.notify_quiet_hours or ""
         retry_attempts = settings.notify_retry_attempts
         retry_backoff = settings.notify_retry_backoff_seconds
         overrides_raw = settings.notify_dedupe_ttl_overrides or ""
         try:
-            from src.web.models import AppSettings
+            from src.web.models import AppSettings, TenantSettings
 
             def _get(key: str) -> str:
+                if tenant_id is not None and not single_tenant_mode():
+                    trow = (
+                        db.query(TenantSettings)
+                        .filter(
+                            TenantSettings.tenant_id == tenant_id,
+                            TenantSettings.key == key,
+                        )
+                        .first()
+                    )
+                    if trow and trow.value:
+                        return trow.value
                 row = db.query(AppSettings).filter(AppSettings.key == key).first()
                 return row.value if row and row.value else ""
 
@@ -464,7 +521,9 @@ class PriceAlertEngine:
 
     async def _send_notify(self, db: Session, rule: PriceAlertRule, snapshot: dict) -> tuple[bool, str]:
         channels = self._resolve_channels(db, rule)
-        notifier = NotifierManager(policy=self._build_notify_policy(db))
+        notifier = NotifierManager(
+            policy=self._build_notify_policy(db, tenant_id=_rule_tenant_id(rule))
+        )
         for ch in channels:
             notifier.add_channel(ch.type, ch.config or {})
 
@@ -512,6 +571,8 @@ class PriceAlertEngine:
         now = _utc_now()
         db = SessionLocal()
         try:
+            # 单 job 全表扫描全部启用规则（T17：不拆 per-tenant job）；
+            # 通知按规则行 tenant_id 路由（T21，见 _resolve_channels）。
             query = db.query(PriceAlertRule).join(Stock).filter(PriceAlertRule.enabled == True)
             if only_rule_id:
                 query = query.filter(PriceAlertRule.id == only_rule_id)
@@ -568,6 +629,8 @@ class PriceAlertEngine:
                 hit = PriceAlertHit(
                     rule_id=rule.id,
                     stock_id=stock.id,
+                    # 显式归属规则行租户（单租户直通下恒为 1，与 server_default 等价）
+                    tenant_id=_rule_tenant_id(rule),
                     trigger_time=now,
                     trigger_bucket=bucket,
                     trigger_snapshot=ev.snapshot,

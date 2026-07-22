@@ -12,8 +12,15 @@ import logging
 from datetime import date
 
 from src.agents.tradingagents.result_mapper import DECISION_LABEL_MAP
+from src.web.tenant_context import DEFAULT_TENANT_ID, current_tenant
 
 logger = logging.getLogger(__name__)
+
+
+def _current_tenant_id() -> int:
+    """当前 ctx 的租户 id；无 ctx（裸脚本/单租户直通）兜底默认租户 1。"""
+    ctx = current_tenant()
+    return ctx.tenant_id if ctx is not None else DEFAULT_TENANT_ID
 
 
 def maybe_emit_paper_trading_signal(
@@ -57,6 +64,9 @@ def maybe_emit_paper_trading_signal(
 
     db = SessionLocal()
     try:
+        # 信号归属租户：watchlist 源行 = 当前租户（docs/26-J2；
+        # 单租户直通下恒为 1，与原行为等价）
+        tenant_id = _current_tenant_id()
         # 同标的当日重复触发 → upsert(source_candidate_id 是 Integer,用 0 当 TA 专用 sentinel)
         source_id = 0
         existing = (
@@ -67,6 +77,7 @@ def maybe_emit_paper_trading_signal(
                 StrategySignalRun.stock_market == stock_market,
                 StrategySignalRun.strategy_code == "tradingagents",
                 StrategySignalRun.source_candidate_id == source_id,
+                StrategySignalRun.tenant_id == tenant_id,
             )
             .first()
         )
@@ -83,6 +94,7 @@ def maybe_emit_paper_trading_signal(
             existing.status = "active"
         else:
             row = StrategySignalRun(
+                tenant_id=tenant_id,
                 snapshot_date=snapshot_date,
                 stock_symbol=stock_symbol,
                 stock_market=stock_market,

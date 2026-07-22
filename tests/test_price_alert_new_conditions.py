@@ -505,4 +505,4 @@ def test_m119_registered_last_after_118():
     assert len(set(versions)) == len(versions)
     pairs = list(zip(versions, versions[1:]))
     assert (118, 119) in pairs
-    assert versions[-1] == 122
+    assert versions[-1] == 123

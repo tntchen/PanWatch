@@ -691,6 +691,7 @@ class StrategySignalRun(Base):
     __tablename__ = "strategy_signal_runs"
     __table_args__ = (
         UniqueConstraint(
+            "tenant_id",
             "snapshot_date",
             "stock_symbol",
             "stock_market",

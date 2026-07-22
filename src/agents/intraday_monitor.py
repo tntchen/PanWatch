@@ -892,6 +892,7 @@ class IntradayMonitorAgent(BaseAgent):
             title=title,
             content=content,
             raw_data={
+                "tenant_id": getattr(context, "tenant_id", 1),
                 "stock": {
                     "symbol": stock.symbol,
                     "name": stock.name,
@@ -928,9 +929,11 @@ class IntradayMonitorAgent(BaseAgent):
         if not symbol:
             return False
 
-        # 检查节流（测试模式可跳过）
+        # 检查节流（测试模式可跳过）。tenant 编入节流键（MT-P3），
+        # tenant_id 由 analyze 写入 raw_data（缺省 1 = 单租户行为等价）。
+        tenant_id = result.raw_data.get("tenant_id", 1)
         if not self.bypass_throttle:
-            if not self._check_throttle(symbol):
+            if not self._check_throttle(symbol, tenant_id=tenant_id):
                 logger.info(
                     f"通知节流: {symbol} 在 {self.throttle_minutes} 分钟内已通知"
                 )
@@ -940,18 +943,27 @@ class IntradayMonitorAgent(BaseAgent):
 
         return True
 
-    def _check_throttle(self, symbol: str) -> bool:
+    def _throttle_key(self, symbol: str, tenant_id: int = 1) -> str:
+        """节流键（MT-P3 / C8）：tenant 编入 stock_symbol 字段值，UQ 不重建。
+
+        单租户期 tenant_id=1 → "1:{symbol}"，与 v120 旧行回填格式一致，
+        行为与改造前（裸 symbol）等价；多租户下同 symbol 跨租户互不吞节流。
+        """
+        return f"{tenant_id}:{symbol}"
+
+    def _check_throttle(self, symbol: str, tenant_id: int = 1) -> bool:
         """检查是否可以发送通知（未被节流）"""
         from src.web.database import SessionLocal
         from src.web.models import NotifyThrottle
 
+        throttle_key = self._throttle_key(symbol, tenant_id)
         db = SessionLocal()
         try:
             record = (
                 db.query(NotifyThrottle)
                 .filter(
                     NotifyThrottle.agent_name == self.name,
-                    NotifyThrottle.stock_symbol == symbol,
+                    NotifyThrottle.stock_symbol == throttle_key,
                 )
                 .first()
             )
@@ -969,18 +981,19 @@ class IntradayMonitorAgent(BaseAgent):
         finally:
             db.close()
 
-    def _update_throttle(self, symbol: str):
+    def _update_throttle(self, symbol: str, tenant_id: int = 1):
         """更新节流记录"""
         from src.web.database import SessionLocal
         from src.web.models import NotifyThrottle
 
+        throttle_key = self._throttle_key(symbol, tenant_id)
         db = SessionLocal()
         try:
             record = (
                 db.query(NotifyThrottle)
                 .filter(
                     NotifyThrottle.agent_name == self.name,
-                    NotifyThrottle.stock_symbol == symbol,
+                    NotifyThrottle.stock_symbol == throttle_key,
                 )
                 .first()
             )
@@ -996,8 +1009,9 @@ class IntradayMonitorAgent(BaseAgent):
             else:
                 db.add(
                     NotifyThrottle(
+                        tenant_id=tenant_id,
                         agent_name=self.name,
-                        stock_symbol=symbol,
+                        stock_symbol=throttle_key,
                         last_notify_at=now,
                         notify_count=1,
                     )
@@ -1045,6 +1059,7 @@ class IntradayMonitorAgent(BaseAgent):
                         price_threshold=self.price_alert_threshold,
                         volume_threshold=self.volume_alert_ratio,
                         current_price=getattr(stock, "current_price", None),
+                        tenant_id=getattr(context, "tenant_id", 1),
                     )
                     data["event_gate"] = {
                         "reasons": decision.reasons,
@@ -1073,7 +1088,10 @@ class IntradayMonitorAgent(BaseAgent):
                         f"Agent [{self.display_name}] 通知已发送: {stock_symbol}"
                     )
                     if not self.bypass_throttle:
-                        self._update_throttle(stock_symbol)
+                        self._update_throttle(
+                            stock_symbol,
+                            tenant_id=getattr(context, "tenant_id", 1),
+                        )
                 else:
                     notify_error = notify_result.get("error") or "未知错误"
                     result.raw_data["notify_error"] = notify_error

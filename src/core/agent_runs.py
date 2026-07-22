@@ -3,6 +3,7 @@ import logging
 
 from src.web.database import SessionLocal
 from src.web.models import AgentRun
+from src.web.tenant_context import DEFAULT_TENANT_ID, current_tenant
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,7 @@ def record_agent_run(
     notify_sent: bool = False,
     context_chars: int = 0,
     model_label: str = "",
+    tenant_id: int | None = None,
 ) -> None:
     """记录一次 Agent 运行结果到数据库。
 
@@ -34,7 +36,11 @@ def record_agent_run(
         notify_sent: 通知是否发送成功
         context_chars: prompt/context 字符数
         model_label: 本次运行使用的模型标识
+        tenant_id: 归属租户；缺省从 TenantContext 解析，兜底默认租户
     """
+    if tenant_id is None:
+        ctx = current_tenant()
+        tenant_id = ctx.tenant_id if ctx else DEFAULT_TENANT_ID
     db = SessionLocal()
     try:
         db.add(AgentRun(
@@ -49,6 +55,7 @@ def record_agent_run(
             result=(result or "")[:2000],
             error=(error or "")[:2000],
             duration_ms=duration_ms,
+            tenant_id=tenant_id,
         ))
         db.commit()
     except Exception as e:

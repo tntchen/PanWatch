@@ -21,9 +21,21 @@ from src.core.playbook import load_active_playbook, summarize_playbook
 from src.models.market import MarketCode
 from src.web.database import SessionLocal
 from src.web.models import AnalysisHistory, Stock
+from src.web.tenant_context import DEFAULT_TENANT_ID, current_tenant
 from src.core.json_safe import to_jsonable
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_tenant_id(tenant_id: int | None) -> int:
+    """租户解析顺序（docs/23 §1.2-P22 / docs/25 §F12）：
+    显式参数 → tenant_scope ctx → 默认租户 1。单租户直通恒落 1。"""
+    if tenant_id is not None:
+        return int(tenant_id)
+    ctx = current_tenant()
+    if ctx is not None:
+        return int(ctx.tenant_id)
+    return DEFAULT_TENANT_ID
 
 # 各市场用于相对强度对比的大盘指数(代码 + 中文标签)。
 # A股优先沪深300(000300);港股恒生指数;美股标普500(efinance 用 .INX)。
@@ -80,13 +92,20 @@ class ContextBuilder:
         self._index_cache: dict[str, dict | None] = {}
 
     @staticmethod
-    def _load_history_news(symbol: str, stock_name: str, days: int = 7) -> list[dict]:
+    def _load_history_news(
+        symbol: str,
+        stock_name: str,
+        days: int = 7,
+        tenant_id: int | None = None,
+    ) -> list[dict]:
+        tid = _resolve_tenant_id(tenant_id)
         cutoff = (date.today() - timedelta(days=max(1, days))).strftime("%Y-%m-%d")
         db = SessionLocal()
         try:
             rows = (
                 db.query(AnalysisHistory)
                 .filter(
+                    AnalysisHistory.tenant_id == tid,
                     AnalysisHistory.agent_name.in_(
                         ("news_digest", "premarket_outlook", "daily_report")
                     ),
@@ -367,6 +386,7 @@ class ContextBuilder:
         market: MarketCode,
         context_type: str,
         days: int = 30,
+        tenant_id: int | None = None,
     ) -> dict:
         try:
             rows = get_recent_stock_context_snapshots(
@@ -375,6 +395,7 @@ class ContextBuilder:
                 context_type=context_type,
                 days=max(1, days),
                 limit=12,
+                tenant_id=tenant_id,
             )
         except Exception:
             rows = []
@@ -425,17 +446,28 @@ class ContextBuilder:
         }
 
     @staticmethod
-    def _load_playbook_summary(symbol: str, market) -> str | None:
+    def _load_playbook_summary(
+        symbol: str,
+        market,
+        tenant_id: int | None = None,
+    ) -> str | None:
         """⑤ 方案档案摘要注入（P3a）：读激活档案并生成紧凑摘要。
 
         无档案 / 股票不存在 / 任何异常 → None，绝不影响主流程。
+        MT-P3（docs/23 §1.2-P15，T15 解析点）：Stock 按 tenant 作用域解析，
+        显式过滤为 tenant_scope 机制点之外的双保险。
         """
+        tid = _resolve_tenant_id(tenant_id)
         db = SessionLocal()
         try:
             mkt = market.value if isinstance(market, MarketCode) else str(market or "")
             stock = (
                 db.query(Stock)
-                .filter(Stock.symbol == symbol, Stock.market == mkt)
+                .filter(
+                    Stock.tenant_id == tid,
+                    Stock.symbol == symbol,
+                    Stock.market == mkt,
+                )
                 .first()
             )
             if not stock:
@@ -462,7 +494,11 @@ class ContextBuilder:
         history_days: int = 7,
         kline_days: int = 120,
         persist_snapshot: bool = True,
+        tenant_id: int | None = None,
     ) -> dict:
+        # MT-P3（docs/23 §1.2-P12/P14/P15）：快照读写与私有表解析点按租户隔离；
+        # 显式 tenant_id 与 server.build_context 新签名对接，机制点自动过滤之外的双保险。
+        tid = _resolve_tenant_id(tenant_id)
         symbol_contexts: dict[str, dict] = {}
         all_news_for_topic: list[dict] = []
         snapshot_date = _iso_today()
@@ -476,7 +512,9 @@ class ContextBuilder:
             pack_news = list((pack.news.items if (pack and pack.news) else []) or [])
             realtime_news = _cut_by_hours(pack_news, realtime_hours)
             extended_news = _cut_by_hours(pack_news, extended_hours)
-            hist_news = self._load_history_news(symbol, stock_name, days=history_days)
+            hist_news = self._load_history_news(
+                symbol, stock_name, days=history_days, tenant_id=tid
+            )
 
             realtime_ranked = rank_news_items(dedupe_news_items(realtime_news), symbol=symbol)
             extended_ranked = rank_news_items(dedupe_news_items(extended_news), symbol=symbol)
@@ -490,6 +528,7 @@ class ContextBuilder:
                 market=market,
                 context_type=agent_name,
                 days=max(history_days, 30),
+                tenant_id=tid,
             )
 
             coverage = {
@@ -536,7 +575,7 @@ class ContextBuilder:
                 ta_verdict = None
 
             # ⑤ 方案档案摘要(P3a):无档案为 None,异常容错不影响主流程
-            playbook_summary = self._load_playbook_summary(symbol, market)
+            playbook_summary = self._load_playbook_summary(symbol, market, tenant_id=tid)
 
             payload = {
                 "symbol": symbol,
@@ -569,6 +608,7 @@ class ContextBuilder:
                     context_type=agent_name,
                     payload=payload,
                     quality=quality,
+                    tenant_id=tid,
                 )
 
         global_topic = summarize_news_topics(
@@ -586,6 +626,7 @@ class ContextBuilder:
                     "stock_count": len(context.watchlist),
                     "news_count": len(all_news_for_topic),
                 },
+                tenant_id=tid,
             )
 
         quality_scores = [

@@ -1,4 +1,13 @@
-"""上下文维护调度器：后验评估 + 过期数据清理 + 机会自动刷新。"""
+"""上下文维护调度器：后验评估 + 过期数据清理 + 机会自动刷新。
+
+MT-P3（docs/23 §2.2 / docs/24 §6，T17/T19）：
+- market_regime / market_scan / strategy 链保持市场级全局单份，不扇出、
+  不引入 tenant 维度（entry_candidates / strategy_signal_runs 走 tenant=0 哨兵）；
+- 私有表维护（agent_prediction_outcomes 后验评估 + 私有快照清理）在
+  多租户模式下于单 job 内遍历活跃租户逐租户执行（tenant_scope 显式入口），
+  job id 原样保留，严禁 per-tenant 注册新 job；
+- 单租户直通模式（PANWATCH_SINGLE_TENANT='1'）走原单次路径，行为与现状等价。
+"""
 
 from __future__ import annotations
 
@@ -17,8 +26,49 @@ from src.core.strategy_engine import (
     rebalance_strategy_weights,
     refresh_strategy_signals,
 )
+from src.web.database import SessionLocal
+from src.web.models import Tenant
+from src.web.tenant_context import (
+    DEFAULT_TENANT_ID,
+    single_tenant_mode,
+    tenant_scope,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _fanout_tenant_ids() -> list[int]:
+    """多租户模式返回活跃租户 id（ORDER BY id 确定性顺序）。
+
+    单租户直通模式返回空表 → 调用方走原单次路径（行为等价保障）；
+    枚举失败回退默认租户，绝不让维护任务整体失效。
+    """
+    if single_tenant_mode():
+        return []
+    try:
+        db = SessionLocal()
+        try:
+            rows = (
+                db.query(Tenant.id)
+                .filter(Tenant.status == "active")
+                .order_by(Tenant.id)
+                .all()
+            )
+            ids = [int(r[0]) for r in rows]
+            return ids or [DEFAULT_TENANT_ID]
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning("[上下文维护] 租户枚举失败，回退默认租户: %s", e)
+        return [DEFAULT_TENANT_ID]
+
+
+def _merge_numeric_stats(total: dict, part: dict) -> dict:
+    """逐租户聚合数值型统计字段（后验评估 stats 全为 int 计数）。"""
+    for key, value in (part or {}).items():
+        if isinstance(value, (int, float)):
+            total[key] = total.get(key, 0) + value
+    return total
 
 
 class ContextMaintenanceScheduler:
@@ -37,13 +87,34 @@ class ContextMaintenanceScheduler:
         self._cleaning = False
         self._refreshing = False
 
+    async def _evaluate_agent_predictions(self) -> dict:
+        """agent_prediction_outcomes 后验评估（J5 判私有：租户级）。
+
+        单租户直通：原单次调用（无 ctx、无显式过滤，行为与现状等价）；
+        多租户：单 job 内遍历活跃租户，tenant_scope 内逐租户评估，单租户
+        失败不阻断后续租户。
+        """
+        tenant_ids = _fanout_tenant_ids()
+        if not tenant_ids:
+            return await asyncio.to_thread(evaluate_pending_prediction_outcomes)
+        stats: dict = {}
+        for tid in tenant_ids:
+            try:
+                with tenant_scope(tid):
+                    part = await asyncio.to_thread(evaluate_pending_prediction_outcomes)
+                _merge_numeric_stats(stats, part)
+            except Exception as e:
+                logger.exception("[上下文维护] 租户 %s 后验评估异常: %s", tid, e)
+                continue
+        return stats
+
     async def _evaluate_job(self):
         if self._evaluating:
             logger.debug("[上下文维护] 上一轮后验评估仍在执行，跳过本轮")
             return
         self._evaluating = True
         try:
-            stats = await asyncio.to_thread(evaluate_pending_prediction_outcomes)
+            stats = await self._evaluate_agent_predictions()
             level = logging.INFO if stats.get("evaluated", 0) else logging.DEBUG
             logger.log(
                 level,
@@ -124,19 +195,42 @@ class ContextMaintenanceScheduler:
         finally:
             self._evaluating = False
 
+    async def _cleanup_context_data(self) -> dict:
+        """私有快照/运行/后验记录清理。
+
+        单租户直通：原全局单次调用（tenant_id=None 不按租户过滤，行为等价）；
+        多租户：单 job 内遍历活跃租户逐租户清理（docs/25：禁一次删全表），
+        聚合各租户删除计数。
+        """
+        kwargs = {
+            "snapshot_days": self.snapshot_retention_days,
+            "topic_days": self.snapshot_retention_days,
+            "context_run_days": self.snapshot_retention_days,
+            "outcome_days": self.outcome_retention_days,
+        }
+        tenant_ids = _fanout_tenant_ids()
+        if not tenant_ids:
+            return await asyncio.to_thread(cleanup_context_data, **kwargs)
+        deleted: dict = {}
+        for tid in tenant_ids:
+            try:
+                with tenant_scope(tid):
+                    part = await asyncio.to_thread(
+                        cleanup_context_data, tenant_id=tid, **kwargs
+                    )
+                _merge_numeric_stats(deleted, part)
+            except Exception as e:
+                logger.exception("[上下文维护] 租户 %s 清理异常: %s", tid, e)
+                continue
+        return deleted
+
     async def _cleanup_job(self):
         if self._cleaning:
             logger.debug("[上下文维护] 上一轮清理仍在执行，跳过本轮")
             return
         self._cleaning = True
         try:
-            deleted = await asyncio.to_thread(
-                cleanup_context_data,
-                snapshot_days=self.snapshot_retention_days,
-                topic_days=self.snapshot_retention_days,
-                context_run_days=self.snapshot_retention_days,
-                outcome_days=self.outcome_retention_days,
-            )
+            deleted = await self._cleanup_context_data()
             # deleted 是 dict,任一字段 >0 就是有清理动作
             has_work = bool(deleted and any(deleted.values()) if isinstance(deleted, dict) else deleted)
             level = logging.INFO if has_work else logging.DEBUG

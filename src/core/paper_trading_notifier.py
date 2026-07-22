@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from contextlib import contextmanager
+from typing import Any, Iterator
+
+from sqlalchemy import or_
 
 from src.core.notifier import NotifierManager
 from src.web.database import SessionLocal
@@ -14,9 +17,48 @@ from src.web.models import (
     PaperTradingPosition,
     PaperTradingTrade,
     StrategySignalRun,
+    Tenant,
+    TenantSettings,
+)
+from src.web.tenant_context import (
+    DEFAULT_TENANT_ID,
+    reset_current_tenant,
+    set_current_tenant,
+    single_tenant_mode,
+    tenant_scope,
 )
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _unscoped_tenant() -> Iterator[None]:
+    """临时清空租户 ctx：用于「本租户 + 托管共享」渠道可见集查询。
+
+    do_orm_execute 自动过滤只能表达 tenant_id == ctx，表达不了
+    ``tenant_id == ctx OR is_shared`` 的共享语义；窗口内查询必须自带显式
+    租户谓词（调用方负责）。
+    """
+    token = set_current_tenant(None)
+    try:
+        yield
+    finally:
+        reset_current_tenant(token)
+
+
+def _pt_tenant_ids(db) -> list[int]:
+    """多租户扇出的租户集合：active 租户 ∪ 已有账户租户（确定性排序）。"""
+    ids: set[int] = set()
+    try:
+        ids |= {
+            t for (t,) in db.query(Tenant.id).filter(Tenant.status == "active").all()
+        }
+    except Exception:
+        pass
+    ids |= {t for (t,) in db.query(PaperTradingAccount.tenant_id).all()}
+    if not ids:
+        ids = {DEFAULT_TENANT_ID}
+    return sorted(ids)
 
 # ---------------------------------------------------------------------------
 # 配置读取
@@ -31,8 +73,13 @@ _CONFIG_KEYS = {
 }
 
 
-def _load_config() -> dict[str, str]:
-    """从 AppSettings 表读取 pt_notify_* 配置。"""
+def _load_config(tenant_id: int | None = None) -> dict[str, str]:
+    """读取 pt_notify_* 配置。
+
+    单租户直通 / tenant_id=None：只读 app_settings（原行为）。
+    多租户且指定 tenant_id：租户级 tenant_settings 优先（T20/F3），缺省键
+    回退 app_settings。
+    """
     db = SessionLocal()
     try:
         rows = (
@@ -43,18 +90,30 @@ def _load_config() -> dict[str, str]:
         cfg = dict(_CONFIG_KEYS)  # defaults
         for r in rows:
             cfg[r.key] = r.value or _CONFIG_KEYS.get(r.key, "")
+        if tenant_id is not None and not single_tenant_mode():
+            trows = (
+                db.query(TenantSettings)
+                .filter(
+                    TenantSettings.tenant_id == tenant_id,
+                    TenantSettings.key.in_(_CONFIG_KEYS.keys()),
+                )
+                .all()
+            )
+            for r in trows:
+                if r.value:
+                    cfg[r.key] = r.value
         return cfg
     finally:
         db.close()
 
 
-def _is_enabled() -> bool:
-    cfg = _load_config()
+def _is_enabled(tenant_id: int | None = None) -> bool:
+    cfg = _load_config(tenant_id)
     return cfg.get("pt_notify_enabled", "").lower() == "true"
 
 
-def _is_mode_enabled(mode_key: str) -> bool:
-    cfg = _load_config()
+def _is_mode_enabled(mode_key: str, tenant_id: int | None = None) -> bool:
+    cfg = _load_config(tenant_id)
     if cfg.get("pt_notify_enabled", "").lower() != "true":
         return False
     return cfg.get(mode_key, "").lower() == "true"
@@ -64,9 +123,13 @@ def _is_mode_enabled(mode_key: str) -> bool:
 # 渠道构建
 # ---------------------------------------------------------------------------
 
-def _build_notifier() -> NotifierManager | None:
-    """根据配置构建 NotifierManager，无可用渠道时返回 None。"""
-    cfg = _load_config()
+def _build_notifier(tenant_id: int | None = None) -> NotifierManager | None:
+    """根据配置构建 NotifierManager，无可用渠道时返回 None。
+
+    多租户且指定 tenant_id 时按账户租户路由渠道（T21）：可见集 =
+    本租户渠道 + 管理员托管共享渠道（is_shared）。
+    """
+    cfg = _load_config(tenant_id)
     if cfg.get("pt_notify_enabled", "").lower() != "true":
         return None
 
@@ -75,18 +138,25 @@ def _build_notifier() -> NotifierManager | None:
         channel_ids_str = cfg.get("pt_notify_channel_ids", "").strip()
         if channel_ids_str:
             ids = [int(x.strip()) for x in channel_ids_str.split(",") if x.strip().isdigit()]
-            channels = (
-                db.query(NotifyChannel)
-                .filter(NotifyChannel.id.in_(ids), NotifyChannel.enabled.is_(True))
-                .all()
+            query = db.query(NotifyChannel).filter(
+                NotifyChannel.id.in_(ids), NotifyChannel.enabled.is_(True)
             )
         else:
             # 未指定渠道时使用默认渠道
-            channels = (
-                db.query(NotifyChannel)
-                .filter(NotifyChannel.enabled.is_(True), NotifyChannel.is_default.is_(True))
-                .all()
+            query = db.query(NotifyChannel).filter(
+                NotifyChannel.enabled.is_(True), NotifyChannel.is_default.is_(True)
             )
+
+        if tenant_id is not None and not single_tenant_mode():
+            with _unscoped_tenant():
+                channels = query.filter(
+                    or_(
+                        NotifyChannel.tenant_id == tenant_id,
+                        NotifyChannel.is_shared.is_(True),
+                    )
+                ).all()
+        else:
+            channels = query.all()
 
         if not channels:
             logger.debug("[模拟盘通知] 无可用通知渠道")
@@ -276,12 +346,17 @@ def _format_daily_summary(
 # 触发函数
 # ---------------------------------------------------------------------------
 
-async def notify_entry(pos: dict, sig: dict | None) -> None:
-    """建仓通知（异步，失败仅日志）。pos/sig 为序列化后的 dict。"""
+async def notify_entry(
+    pos: dict, sig: dict | None, tenant_id: int | None = None
+) -> None:
+    """建仓通知（异步，失败仅日志）。pos/sig 为序列化后的 dict。
+
+    tenant_id：多租户扇出时按事件归属租户路由渠道；None = 旧行为。
+    """
     try:
-        if not _is_mode_enabled("pt_notify_realtime"):
+        if not _is_mode_enabled("pt_notify_realtime", tenant_id):
             return
-        mgr = _build_notifier()
+        mgr = _build_notifier(tenant_id)
         if not mgr:
             return
         title, body = _format_entry_message(pos, sig)
@@ -290,12 +365,14 @@ async def notify_entry(pos: dict, sig: dict | None) -> None:
         logger.exception("[模拟盘通知] 建仓通知发送失败")
 
 
-async def notify_exit(pos: dict, trade: dict) -> None:
+async def notify_exit(
+    pos: dict, trade: dict, tenant_id: int | None = None
+) -> None:
     """平仓通知（异步，失败仅日志）。pos/trade 为序列化后的 dict。"""
     try:
-        if not _is_mode_enabled("pt_notify_realtime"):
+        if not _is_mode_enabled("pt_notify_realtime", tenant_id):
             return
-        mgr = _build_notifier()
+        mgr = _build_notifier(tenant_id)
         if not mgr:
             return
         title, body = _format_exit_message(pos, trade)
@@ -304,91 +381,138 @@ async def notify_exit(pos: dict, trade: dict) -> None:
         logger.exception("[模拟盘通知] 平仓通知发送失败")
 
 
-async def send_premarket_plan() -> None:
-    """盘前计划通知。"""
+def _account_for_tenant(db, tenant_id: int | None) -> PaperTradingAccount | None:
+    """取账户：tenant_id=None 保持原 ``.first()`` 单例行为；否则按租户过滤。"""
+    if tenant_id is None:
+        return db.query(PaperTradingAccount).first()
+    return (
+        db.query(PaperTradingAccount)
+        .filter(PaperTradingAccount.tenant_id == tenant_id)
+        .first()
+    )
+
+
+async def _send_premarket_plan_one(tenant_id: int | None) -> None:
+    """单租户（或单例）盘前计划。tenant_id=None 时与原行为完全一致。"""
+    if not _is_mode_enabled("pt_notify_premarket", tenant_id):
+        return
+    mgr = _build_notifier(tenant_id)
+    if not mgr:
+        return
+
+    db = SessionLocal()
     try:
-        if not _is_mode_enabled("pt_notify_premarket"):
-            return
-        mgr = _build_notifier()
-        if not mgr:
+        account = _account_for_tenant(db, tenant_id)
+        if not account or not account.enabled:
             return
 
+        # 按投资比例排除不投入（比例为 0）的市场
+        from src.core.paper_trading_engine import ALL_MARKETS, market_allocations_or_default
+        alloc = market_allocations_or_default(account)
+        excluded = [m for m in ALL_MARKETS if alloc.get(m, 0.0) <= 0]
+        query = (
+            db.query(StrategySignalRun)
+            .filter(
+                StrategySignalRun.status == "active",
+                StrategySignalRun.action.in_(["buy", "add"]),
+                StrategySignalRun.entry_low.isnot(None),
+                StrategySignalRun.entry_high.isnot(None),
+            )
+        )
+        if excluded:
+            query = query.filter(StrategySignalRun.stock_market.notin_(excluded))
+        signals = query.order_by(StrategySignalRun.rank_score.desc()).all()
+
+        title, body = _format_premarket_plan(signals, account)
+        await mgr.notify(title, body)
+    finally:
+        db.close()
+
+
+async def send_premarket_plan() -> None:
+    """盘前计划通知。多租户：单 job 内遍历租户，逐租户路由（T9/T17/T21）。"""
+    try:
+        if single_tenant_mode():
+            await _send_premarket_plan_one(None)
+            return
         db = SessionLocal()
         try:
-            account = db.query(PaperTradingAccount).first()
-            if not account or not account.enabled:
-                return
-
-            # 按投资比例排除不投入（比例为 0）的市场
-            from src.core.paper_trading_engine import ALL_MARKETS, market_allocations_or_default
-            alloc = market_allocations_or_default(account)
-            excluded = [m for m in ALL_MARKETS if alloc.get(m, 0.0) <= 0]
-            query = (
-                db.query(StrategySignalRun)
-                .filter(
-                    StrategySignalRun.status == "active",
-                    StrategySignalRun.action.in_(["buy", "add"]),
-                    StrategySignalRun.entry_low.isnot(None),
-                    StrategySignalRun.entry_high.isnot(None),
-                )
-            )
-            if excluded:
-                query = query.filter(StrategySignalRun.stock_market.notin_(excluded))
-            signals = query.order_by(StrategySignalRun.rank_score.desc()).all()
-
-            title, body = _format_premarket_plan(signals, account)
-            await mgr.notify(title, body)
+            tenant_ids = _pt_tenant_ids(db)
         finally:
             db.close()
+        for tid in tenant_ids:
+            try:
+                with tenant_scope(tid):
+                    await _send_premarket_plan_one(tid)
+            except Exception:
+                logger.exception("[模拟盘通知] 租户 %s 盘前计划发送失败", tid)
     except Exception:
         logger.exception("[模拟盘通知] 盘前计划发送失败")
 
 
-async def send_daily_summary() -> None:
-    """日终摘要通知。"""
+async def _send_daily_summary_one(tenant_id: int | None) -> None:
+    """单租户（或单例）日终摘要。tenant_id=None 时与原行为完全一致。"""
+    if not _is_mode_enabled("pt_notify_summary", tenant_id):
+        return
+    mgr = _build_notifier(tenant_id)
+    if not mgr:
+        return
+
+    db = SessionLocal()
     try:
-        if not _is_mode_enabled("pt_notify_summary"):
-            return
-        mgr = _build_notifier()
-        if not mgr:
+        account = _account_for_tenant(db, tenant_id)
+        if not account or not account.enabled:
             return
 
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        # 当日已平仓
+        trades = (
+            db.query(PaperTradingTrade)
+            .filter(PaperTradingTrade.closed_at >= today_start)
+            .order_by(PaperTradingTrade.closed_at.desc())
+            .all()
+        )
+
+        # 持仓中
+        positions = (
+            db.query(PaperTradingPosition)
+            .filter(PaperTradingPosition.status == "open")
+            .all()
+        )
+
+        title, body = _format_daily_summary(trades, positions, account)
+        await mgr.notify(title, body)
+    finally:
+        db.close()
+
+
+async def send_daily_summary() -> None:
+    """日终摘要通知。多租户：单 job 内遍历租户，逐租户路由（T9/T17/T21）。"""
+    try:
+        if single_tenant_mode():
+            await _send_daily_summary_one(None)
+            return
         db = SessionLocal()
         try:
-            account = db.query(PaperTradingAccount).first()
-            if not account or not account.enabled:
-                return
-
-            from datetime import datetime, timezone, timedelta
-            now = datetime.now(timezone.utc)
-            today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-
-            # 当日已平仓
-            trades = (
-                db.query(PaperTradingTrade)
-                .filter(PaperTradingTrade.closed_at >= today_start)
-                .order_by(PaperTradingTrade.closed_at.desc())
-                .all()
-            )
-
-            # 持仓中
-            positions = (
-                db.query(PaperTradingPosition)
-                .filter(PaperTradingPosition.status == "open")
-                .all()
-            )
-
-            title, body = _format_daily_summary(trades, positions, account)
-            await mgr.notify(title, body)
+            tenant_ids = _pt_tenant_ids(db)
         finally:
             db.close()
+        for tid in tenant_ids:
+            try:
+                with tenant_scope(tid):
+                    await _send_daily_summary_one(tid)
+            except Exception:
+                logger.exception("[模拟盘通知] 租户 %s 日终摘要发送失败", tid)
     except Exception:
         logger.exception("[模拟盘通知] 日终摘要发送失败")
 
 
-async def send_test_notification() -> dict:
-    """发送测试通知，返回结果。"""
-    mgr = _build_notifier()
+async def send_test_notification(tenant_id: int | None = None) -> dict:
+    """发送测试通知，返回结果。tenant_id=None 保持原行为。"""
+    mgr = _build_notifier(tenant_id)
     if not mgr:
         return {"success": False, "error": "通知未启用或无可用渠道"}
     result = await mgr.notify_with_result(

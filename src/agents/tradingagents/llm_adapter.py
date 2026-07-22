@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Any, Iterator
 
 from src.core.ai_client import AIClient
 
@@ -18,6 +20,77 @@ logger = logging.getLogger(__name__)
 
 # TradingAgents selected_analysts 字段的合法值(见上游 graph/trading_graph.py)
 VALID_ANALYSTS = {"market", "social", "news", "fundamentals"}
+
+
+# ---------------------------------------------------------------------------
+# 按调用传 API key（风险 #20：禁止往进程 env 注 key）
+# ---------------------------------------------------------------------------
+
+_ta_api_key: ContextVar[str | None] = ContextVar("panwatch_ta_api_key", default=None)
+
+
+@contextmanager
+def ta_api_key_context(api_key: str | None) -> Iterator[None]:
+    """把本次调用的 API key 放入 ContextVar（不写进程 env）。
+
+    多租户并发场景下，进程级 env 注 key 会被后跑租户覆盖/泄漏给子进程；
+    ContextVar 随调用隔离，TradingAgentsGraph 构造 LLM client 时经
+    apply_ta_api_key_patch() 的补丁从此处取 key。
+    """
+    token = _ta_api_key.set(api_key or None)
+    try:
+        yield
+    finally:
+        _ta_api_key.reset(token)
+
+
+_PATCH_APPLIED = False
+
+
+def apply_ta_api_key_patch() -> bool:
+    """幂等 patch TradingAgents：LLM client 从 ContextVar 取 key，不读进程 env。
+
+    两处手术（上游 tradingagents 行为）：
+    1. 包装 ``TradingAgentsGraph._get_provider_kwargs``——把 ContextVar 中的
+       key 以 ``api_key`` kwarg 传给 create_llm_client；
+       ``OpenAIClient._PASSTHROUGH_KWARGS`` 含 api_key，会透传到
+       ``ChatOpenAI(api_key=...)``（anthropic/google client 同样支持）。
+    2. openrouter ProviderSpec 改 key_optional——上游 get_llm() 在 env 缺失
+       且非 key_optional 时会**先于透传** raise ValueError；改为 placeholder
+       后由透传覆盖为真实 key（ctx 缺 key 时以占位 key 发请求，上游 401
+       可见失败，不会静默用错别的租户的 key）。
+    """
+    global _PATCH_APPLIED
+    if _PATCH_APPLIED:
+        return True
+    try:
+        from dataclasses import replace
+
+        from tradingagents.graph.trading_graph import TradingAgentsGraph
+        from tradingagents.llm_clients.openai_client import (
+            OPENAI_COMPATIBLE_PROVIDERS,
+        )
+    except ImportError as e:
+        logger.warning("[TA] api_key patch 未应用（tradingagents 不可用）: %s", e)
+        return False
+
+    orig_get_provider_kwargs = TradingAgentsGraph._get_provider_kwargs
+
+    def _patched_get_provider_kwargs(self) -> dict:
+        kwargs = orig_get_provider_kwargs(self)
+        key = _ta_api_key.get()
+        if key:
+            kwargs["api_key"] = key
+        return kwargs
+
+    TradingAgentsGraph._get_provider_kwargs = _patched_get_provider_kwargs
+
+    spec = OPENAI_COMPATIBLE_PROVIDERS.get("openrouter")
+    if spec is not None and not spec.key_optional:
+        OPENAI_COMPATIBLE_PROVIDERS["openrouter"] = replace(spec, key_optional=True)
+
+    _PATCH_APPLIED = True
+    return True
 
 
 def build_ta_llm_config(
@@ -89,15 +162,11 @@ def build_ta_llm_config(
 
 
 def inject_api_key_env(ai_client: AIClient) -> None:
-    """把 PanWatch AI 服务的 API key 注入到环境变量。
+    """【已废弃，仅保留兼容】把 PanWatch AI 服务的 API key 注入到环境变量。
 
-    TradingAgents llm_clients 按 provider 读不同 env var
-    (OPENAI_API_KEY / DEEPSEEK_API_KEY / OPENROUTER_API_KEY 等)。
-    我们 PanWatch 走 openrouter 兼容模式(chat completions),所以注入
-    OPENROUTER_API_KEY。同时也设 OPENAI_API_KEY 作 fallback。
-
-    注意:这是进程级 env var,如果同进程并发跑多个不同 key 的请求,可能竞态。
-    P0 假设 max_workers=2 且只用一个 AI service,可接受。
+    ⚠️ 风险 #20：进程级 env 注 key 在多租户并发下会被后跑租户覆盖、并泄漏
+    给子进程。生产链路（agent.py）已改走 ta_api_key_context +
+    apply_ta_api_key_patch 按调用传 key，不再调用本函数。
     """
     if not ai_client.api_key:
         logger.warning("[TA] AIClient 没有 api_key,TradingAgents LLM 调用大概率失败")

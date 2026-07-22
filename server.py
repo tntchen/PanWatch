@@ -11,6 +11,7 @@ import uvicorn
 from src.web.database import init_db, SessionLocal
 from src.web.models import (
     AgentConfig,
+    AgentConfigOverride,
     Stock,
     StockAgent,
     AIService,
@@ -18,7 +19,19 @@ from src.web.models import (
     NotifyChannel,
     AppSettings,
     DataSource,
+    TenantSettings,
+    User,
 )
+from src.web.tenant_context import DEFAULT_TENANT_ID, tenant_scope, current_tenant
+
+
+def _resolve_tenant_id(tenant_id: int | None) -> int:
+    """显式 tenant_id 优先；缺省时取当前 TenantContext（web 请求/后台 scope），
+    最后兜底默认租户（单租户直通模式等价行为）。"""
+    if tenant_id is not None:
+        return tenant_id
+    ctx = current_tenant()
+    return ctx.tenant_id if ctx else DEFAULT_TENANT_ID
 from src.web.log_handler import DBLogHandler
 from src.config import Settings, AppConfig, StockConfig
 from src.models.market import MarketCode
@@ -277,7 +290,12 @@ def setup_playwright():
 
 
 def seed_sample_stocks():
-    """首次启动时添加示例股票"""
+    """首次启动时添加示例股票
+
+    MT-P3（docs/23 §5.1）：仅全表为空（全新实例首次启动）时插入，
+    行归属默认租户 tenant_id=1（T18 列默认值）；新租户不补示例股，
+    自选股从零开始（与 T21「新租户默认零渠道」同哲学）。
+    """
     db = SessionLocal()
     try:
         # 只在没有任何股票时才添加示例
@@ -300,7 +318,13 @@ def seed_sample_stocks():
 
 
 def seed_agents():
-    """初始化内置 Agent 配置"""
+    """初始化内置 Agent 配置（系统模板表）。
+
+    MT-P3（docs/23 §5.1）：agent_configs 为实例级「系统模板表」，
+    本函数只 upsert AGENT_SEED_SPECS 内的模板行，只增/只更新不删除；
+    租户个性化 100% 落在 agent_config_overrides 表（T4/J6），
+    本函数永不触碰 override 行，不存在误删租户自定义的问题。
+    """
     db = SessionLocal()
     for spec in AGENT_SEED_SPECS:
         existing = db.query(AgentConfig).filter(AgentConfig.name == spec.name).first()
@@ -660,6 +684,10 @@ def seed_data_sources(db=None) -> list[dict]:
     (供 reconcile_data_sources 在同一事务里接着做删孤儿)。
 
     返回本次新增(缺失被补齐)的种子记录摘要列表 [{"name","type","provider"}, ...]。
+
+    MT-P3（docs/23 §5.1）：data_sources 为实例级共享表（T3 凭证管理员托管），
+    无租户行概念，只增不删；reconcile 的孤儿判定集合不含租户维度，
+    用户自定义行（含改配行）一律保留。
     """
     owns_session = db is None
     if owns_session:
@@ -743,12 +771,25 @@ def seed_strategies():
     logger.info("策略目录初始化完成")
 
 
-def load_watchlist_for_agent(agent_name: str) -> list[StockConfig]:
-    """从数据库加载某个 Agent 关联的自选股"""
+def load_watchlist_for_agent(
+    agent_name: str, tenant_id: int | None = None
+) -> list[StockConfig]:
+    """从数据库加载某个 Agent 关联的自选股（MT-P3：按租户过滤，docs/23 P4）。
+
+    StockAgent 绑定行按 tenant_id 过滤；Stock 由绑定行父行派生，天然租户内
+    （T18 子行仅父派生不变量）。tenant_id 缺省时从 TenantContext 解析（web 层
+    安全），单租户直通模式下全部行 tenant_id=1，行为与现状等价。
+    """
+    tenant_id = _resolve_tenant_id(tenant_id)
     db = SessionLocal()
     try:
         stock_agents = (
-            db.query(StockAgent).filter(StockAgent.agent_name == agent_name).all()
+            db.query(StockAgent)
+            .filter(
+                StockAgent.agent_name == agent_name,
+                StockAgent.tenant_id == tenant_id,
+            )
+            .all()
         )
         stock_ids = [sa.stock_id for sa in stock_agents]
         if not stock_ids:
@@ -863,22 +904,38 @@ def format_trades_text(trades: list[dict]) -> str:
     return "; ".join(segments)[:TRADES_TEXT_CHAR_BUDGET]
 
 
-def load_portfolio_for_agent(agent_name: str) -> PortfolioInfo:
-    """从数据库加载某个 Agent 关联股票的持仓信息（包括多账户）"""
+def load_portfolio_for_agent(
+    agent_name: str, tenant_id: int | None = None
+) -> PortfolioInfo:
+    """从数据库加载某个 Agent 关联股票的持仓信息（包括多账户）。
+
+    MT-P3（docs/23 P5）：StockAgent/Account 按 tenant_id 过滤，
+    Position 经 account 派生，天然租户内。tenant_id 缺省从 TenantContext 解析。
+    """
+    tenant_id = _resolve_tenant_id(tenant_id)
     from src.web.models import Account, Position
 
     db = SessionLocal()
     try:
-        # 获取 Agent 关联的股票 ID
+        # 获取 Agent 关联的股票 ID（本租户绑定行）
         stock_agents = (
-            db.query(StockAgent).filter(StockAgent.agent_name == agent_name).all()
+            db.query(StockAgent)
+            .filter(
+                StockAgent.agent_name == agent_name,
+                StockAgent.tenant_id == tenant_id,
+            )
+            .all()
         )
         stock_ids = set(sa.stock_id for sa in stock_agents)
         if not stock_ids:
             return PortfolioInfo()
 
-        # 获取所有启用的账户
-        accounts = db.query(Account).filter(Account.enabled == True).all()
+        # 获取本租户所有启用的账户
+        accounts = (
+            db.query(Account)
+            .filter(Account.enabled == True, Account.tenant_id == tenant_id)
+            .all()
+        )
 
         account_infos = []
         for acc in accounts:
@@ -940,8 +997,14 @@ def load_portfolio_for_agent(agent_name: str) -> PortfolioInfo:
         db.close()
 
 
-def load_portfolio_for_stock(stock_id: int) -> PortfolioInfo:
-    """从数据库加载单只股票的持仓信息"""
+def load_portfolio_for_stock(
+    stock_id: int, tenant_id: int = DEFAULT_TENANT_ID
+) -> PortfolioInfo:
+    """从数据库加载单只股票的持仓信息。
+
+    MT-P3（docs/23 P6）：防御性断言 stock.tenant_id == tenant_id，
+    违例返回空组合 + 告警日志（不静默用错数据，T16）。
+    """
     from src.web.models import Account, Position
 
     db = SessionLocal()
@@ -949,13 +1012,24 @@ def load_portfolio_for_stock(stock_id: int) -> PortfolioInfo:
         stock = db.query(Stock).filter(Stock.id == stock_id).first()
         if not stock:
             return PortfolioInfo()
+        stock_tenant = getattr(stock, "tenant_id", DEFAULT_TENANT_ID)
+        if stock_tenant != tenant_id:
+            logger.warning(
+                f"load_portfolio_for_stock 租户越权防御: stock_id={stock_id} "
+                f"属租户 {stock_tenant}，调用方租户 {tenant_id}，返回空组合"
+            )
+            return PortfolioInfo()
 
         try:
             market = MarketCode(stock.market)
         except ValueError:
             market = MarketCode.CN
 
-        accounts = db.query(Account).filter(Account.enabled == True).all()
+        accounts = (
+            db.query(Account)
+            .filter(Account.enabled == True, Account.tenant_id == tenant_id)
+            .all()
+        )
 
         account_infos = []
         for acc in accounts:
@@ -1019,36 +1093,151 @@ def _get_app_setting(key: str) -> str:
         db.close()
 
 
-def resolve_ai_model(
-    agent_name: str, stock_agent_id: int | None = None
-) -> tuple[AIModel | None, AIService | None]:
-    """解析 AI 模型: stock_agent 覆盖 → agent 默认 → 系统默认(is_default=True)
-    返回 (model, service) 元组"""
+def _get_tenant_setting(tenant_id: int, key: str) -> str:
+    """租户级配置读取（T20 三分）：tenant_settings 优先，缺省回退实例级 app_settings。
+
+    单租户直通模式下 tenant_settings 为空 → 恒回退 app_settings，与现状等价。
+    """
     db = SessionLocal()
     try:
+        row = (
+            db.query(TenantSettings)
+            .filter(
+                TenantSettings.tenant_id == tenant_id,
+                TenantSettings.key == key,
+            )
+            .first()
+        )
+        if row is not None and row.value:
+            return row.value
+    finally:
+        db.close()
+    return _get_app_setting(key)
+
+
+def _tenant_shares_admin_quota(db, tenant_id: int) -> bool:
+    """T13：租户是否与管理员共享 AI 配额（任一活跃用户勾选即视为共享）。"""
+    if tenant_id == DEFAULT_TENANT_ID:
+        return True  # 管理员租户恒见自身托管服务
+    return (
+        db.query(User.id)
+        .filter(
+            User.tenant_id == tenant_id,
+            User.is_active == True,  # noqa: E712
+            User.quota_shared_with_admin == True,  # noqa: E712
+        )
+        .first()
+        is not None
+    )
+
+
+def _visible_ai_service_ids(db, tenant_id: int) -> list[int]:
+    """T13 租户 AI 服务可见集：本租户自建 +（共享配额时）管理员托管服务。"""
+    ids = [
+        row[0]
+        for row in db.query(AIService.id)
+        .filter(AIService.tenant_id == tenant_id)
+        .all()
+    ]
+    if tenant_id != DEFAULT_TENANT_ID and _tenant_shares_admin_quota(db, tenant_id):
+        ids.extend(
+            row[0]
+            for row in db.query(AIService.id)
+            .filter(AIService.tenant_id == DEFAULT_TENANT_ID)
+            .all()
+        )
+    return ids
+
+
+def resolve_ai_model(
+    agent_name: str,
+    stock_agent_id: int | None = None,
+    tenant_id: int | None = None,
+) -> tuple[AIModel | None, AIService | None]:
+    """解析 AI 模型（MT-P3，docs/23 §6.1）。
+
+    优先级链（T4）：stock_agent 覆盖 → 租户 override（agent_config_overrides）
+    → 模板（agent_configs）→ 租户可见集内 is_default → 可见集内第一个。
+    可见集按 T13：quota_shared_with_admin=True 的租户可见管理员托管服务模型，
+    否则仅本租户自建服务模型；引用不可见模型视为未配置并告警。
+    返回 (model, service) 元组；可见集为空返回 (None, None)（fail-soft，
+    调用方记「未配置 AI」）。单租户直通模式下可见集=全表，与旧链等价。
+    tenant_id 缺省从 TenantContext 解析。
+    """
+    tenant_id = _resolve_tenant_id(tenant_id)
+    db = SessionLocal()
+    try:
+        visible_service_ids = _visible_ai_service_ids(db, tenant_id)
+
+        def _model_visible(mid: int | None) -> bool:
+            if not mid:
+                return False
+            svc_id = (
+                db.query(AIModel.service_id).filter(AIModel.id == mid).scalar()
+            )
+            if svc_id is None:
+                return False
+            if svc_id not in visible_service_ids:
+                logger.warning(
+                    f"resolve_ai_model: 模型 {mid} 对租户 {tenant_id} 不可见，按未配置处理"
+                )
+                return False
+            return True
+
         model_id = None
 
-        # 1. stock_agent 级别覆盖
+        # 1. stock_agent 级别覆盖（绑定行按租户过滤）
         if stock_agent_id:
-            sa = db.query(StockAgent).filter(StockAgent.id == stock_agent_id).first()
-            if sa and sa.ai_model_id:
+            sa = (
+                db.query(StockAgent)
+                .filter(
+                    StockAgent.id == stock_agent_id,
+                    StockAgent.tenant_id == tenant_id,
+                )
+                .first()
+            )
+            if sa and _model_visible(sa.ai_model_id):
                 model_id = sa.ai_model_id
 
-        # 2. agent 级别默认
+        # 2. 租户 override（T4，整体替换语义）
+        if not model_id:
+            override = (
+                db.query(AgentConfigOverride)
+                .filter(
+                    AgentConfigOverride.tenant_id == tenant_id,
+                    AgentConfigOverride.agent_name == agent_name,
+                )
+                .first()
+            )
+            if override and _model_visible(override.ai_model_id):
+                model_id = override.ai_model_id
+
+        # 3. 模板（agent_configs 实例级共享表，全局读）
         if not model_id:
             agent = db.query(AgentConfig).filter(AgentConfig.name == agent_name).first()
-            if agent and agent.ai_model_id:
+            if agent and _model_visible(agent.ai_model_id):
                 model_id = agent.ai_model_id
 
-        # 3. 系统默认
-        if not model_id:
-            default_model = db.query(AIModel).filter(AIModel.is_default == True).first()
+        # 4. 可见集内系统默认
+        if not model_id and visible_service_ids:
+            default_model = (
+                db.query(AIModel)
+                .filter(
+                    AIModel.is_default == True,  # noqa: E712
+                    AIModel.service_id.in_(visible_service_ids),
+                )
+                .first()
+            )
             if default_model:
                 model_id = default_model.id
 
-        # 4. 回退：取第一个
-        if not model_id:
-            first_model = db.query(AIModel).first()
+        # 5. 回退：可见集内第一个
+        if not model_id and visible_service_ids:
+            first_model = (
+                db.query(AIModel)
+                .filter(AIModel.service_id.in_(visible_service_ids))
+                .first()
+            )
             if first_model:
                 model_id = first_model.id
 
@@ -1069,33 +1258,71 @@ def resolve_ai_model(
         db.close()
 
 
+def _visible_notify_channel_filter(tenant_id: int):
+    """T21 渠道可见性谓词：本租户私有渠道 + is_shared 管理员托管渠道。"""
+    return (NotifyChannel.tenant_id == tenant_id) | (
+        NotifyChannel.is_shared == True  # noqa: E712
+    )
+
+
 def resolve_notify_channels(
-    agent_name: str, stock_agent_id: int | None = None
+    agent_name: str,
+    stock_agent_id: int | None = None,
+    tenant_id: int | None = None,
 ) -> list[NotifyChannel]:
-    """解析通知渠道: stock_agent 覆盖 → agent 默认 → 系统默认(is_default=True)"""
+    """解析通知渠道（MT-P3，docs/23 §6.2）。
+
+    优先级链（T4）：stock_agent 覆盖 → 租户 override → 模板 → 可见集内 is_default。
+    可见集按 T21：本租户私有 + is_shared 托管渠道；id 列表逐条校验可见性。
+    新租户默认零渠道 → 返回空列表（调用方走 notify skipped 路径，不视为错误）。
+    单租户直通模式下全部行 tenant_id=1，可见集=全表，与旧链等价。
+    tenant_id 缺省从 TenantContext 解析。
+    """
+    tenant_id = _resolve_tenant_id(tenant_id)
     db = SessionLocal()
     try:
         channel_ids = None
 
-        # 1. stock_agent 级别覆盖
+        # 1. stock_agent 级别覆盖（绑定行按租户过滤）
         if stock_agent_id:
-            sa = db.query(StockAgent).filter(StockAgent.id == stock_agent_id).first()
+            sa = (
+                db.query(StockAgent)
+                .filter(
+                    StockAgent.id == stock_agent_id,
+                    StockAgent.tenant_id == tenant_id,
+                )
+                .first()
+            )
             if sa and sa.notify_channel_ids:
                 channel_ids = sa.notify_channel_ids
 
-        # 2. agent 级别默认
+        # 2. 租户 override（T4，整体替换语义；None 表示不覆盖该字段）
+        if channel_ids is None:
+            override = (
+                db.query(AgentConfigOverride)
+                .filter(
+                    AgentConfigOverride.tenant_id == tenant_id,
+                    AgentConfigOverride.agent_name == agent_name,
+                )
+                .first()
+            )
+            if override is not None and override.notify_channel_ids is not None:
+                channel_ids = override.notify_channel_ids
+
+        # 3. 模板（agent_configs 实例级共享表；模板引用管理员渠道即托管引用，T21 允许）
         if channel_ids is None:
             agent = db.query(AgentConfig).filter(AgentConfig.name == agent_name).first()
             if agent and agent.notify_channel_ids:
                 channel_ids = agent.notify_channel_ids
 
-        # 3. 按 id 列表查询或取系统默认
+        # 4. 按 id 列表查询（逐条校验可见性）或取可见集内 is_default
         if channel_ids:
             channels = (
                 db.query(NotifyChannel)
                 .filter(
                     NotifyChannel.id.in_(channel_ids),
-                    NotifyChannel.enabled == True,
+                    NotifyChannel.enabled == True,  # noqa: E712
+                    _visible_notify_channel_filter(tenant_id),
                 )
                 .all()
             )
@@ -1103,8 +1330,9 @@ def resolve_notify_channels(
             channels = (
                 db.query(NotifyChannel)
                 .filter(
-                    NotifyChannel.is_default == True,
-                    NotifyChannel.enabled == True,
+                    NotifyChannel.is_default == True,  # noqa: E712
+                    NotifyChannel.enabled == True,  # noqa: E712
+                    _visible_notify_channel_filter(tenant_id),
                 )
                 .all()
             )
@@ -1116,17 +1344,24 @@ def resolve_notify_channels(
         db.close()
 
 
-def _build_notifier(channels: list[NotifyChannel]) -> NotifierManager:
-    """根据解析后的渠道列表构建 NotifierManager"""
+def _build_notifier(
+    channels: list[NotifyChannel], tenant_id: int = DEFAULT_TENANT_ID
+) -> NotifierManager:
+    """根据解析后的渠道列表构建 NotifierManager。
+
+    MT-P3（docs/23 P9）：notify_* 配置为租户级（tenant_settings 优先，
+    回退实例级 app_settings）；http_proxy 仍为实例级（见 _get_proxy）。
+    """
     settings = Settings()
-    # allow UI override via app_settings
-    quiet_hours = _get_app_setting("notify_quiet_hours") or settings.notify_quiet_hours
-    retry_attempts_raw = _get_app_setting("notify_retry_attempts")
-    backoff_raw = _get_app_setting("notify_retry_backoff_seconds")
-    overrides_raw = (
-        _get_app_setting("notify_dedupe_ttl_overrides")
-        or settings.notify_dedupe_ttl_overrides
-    )
+    # allow UI override via app_settings（MT-P3：经 tenant_settings 租户级覆盖）
+    quiet_hours = _get_tenant_setting(
+        tenant_id, "notify_quiet_hours"
+    ) or settings.notify_quiet_hours
+    retry_attempts_raw = _get_tenant_setting(tenant_id, "notify_retry_attempts")
+    backoff_raw = _get_tenant_setting(tenant_id, "notify_retry_backoff_seconds")
+    overrides_raw = _get_tenant_setting(
+        tenant_id, "notify_dedupe_ttl_overrides"
+    ) or settings.notify_dedupe_ttl_overrides
 
     try:
         retry_attempts = (
@@ -1180,21 +1415,29 @@ def _build_ai_client(
     )
 
 
-def build_context(agent_name: str, stock_agent_id: int | None = None) -> AgentContext:
-    """为指定 Agent 构建运行上下文"""
+def build_context(
+    agent_name: str,
+    stock_agent_id: int | None = None,
+    tenant_id: int = DEFAULT_TENANT_ID,
+) -> AgentContext:
+    """为指定 Agent 构建运行上下文（MT-P3：tenant_id 显式下传全链，docs/23 P3）。
+
+    tenant_id 带默认值保旧调用兼容；调度链统一走 _scheduler_context_builder
+    （tenant_id 前置签名，docs/23 P2）。单租户直通模式 tenant_id=1 与现状等价。
+    """
     settings = Settings()
-    watchlist = load_watchlist_for_agent(agent_name)
-    portfolio = load_portfolio_for_agent(agent_name)
+    watchlist = load_watchlist_for_agent(agent_name, tenant_id=tenant_id)
+    portfolio = load_portfolio_for_agent(agent_name, tenant_id=tenant_id)
     proxy = _get_proxy() or settings.http_proxy
 
-    model, service = resolve_ai_model(agent_name, stock_agent_id)
+    model, service = resolve_ai_model(agent_name, stock_agent_id, tenant_id=tenant_id)
     ai_client = _build_ai_client(model, service, proxy)
-    channels = resolve_notify_channels(agent_name, stock_agent_id)
-    notifier = _build_notifier(channels)
+    channels = resolve_notify_channels(agent_name, stock_agent_id, tenant_id=tenant_id)
+    notifier = _build_notifier(channels, tenant_id=tenant_id)
 
     model_label = f"{service.name}/{model.model}" if model and service else ""
     config = AppConfig(settings=settings, watchlist=watchlist)
-    return AgentContext(
+    context = AgentContext(
         ai_client=ai_client,
         notifier=notifier,
         config=config,
@@ -1202,6 +1445,18 @@ def build_context(agent_name: str, stock_agent_id: int | None = None) -> AgentCo
         model_label=model_label,
         notify_policy=getattr(notifier, "policy", None),
     )
+    # MT-P3 P1 前置：AgentContext.tenant_id 字段由 base.py 负责声明；
+    # 在字段落地前先以动态属性携带，供去重 scope/事件门等链路读取（P18/P19）。
+    try:
+        setattr(context, "tenant_id", tenant_id)
+    except Exception:
+        pass
+    return context
+
+
+def _scheduler_context_builder(tenant_id: int, agent_name: str) -> AgentContext:
+    """调度链 context 构建入口（docs/23 P2/P3：tenant_id 前置签名）。"""
+    return build_context(agent_name, tenant_id=tenant_id)
 
 
 # Agent 注册表
@@ -1222,8 +1477,9 @@ def build_scheduler() -> AgentScheduler:
     settings = Settings()
     sched = AgentScheduler(timezone=settings.app_timezone)
 
-    # 设置 context 构建函数（每次执行时动态获取最新配置）
-    sched.set_context_builder(build_context)
+    # 设置 context 构建函数（每次执行时动态获取最新配置；
+    # MT-P3：签名 (tenant_id, agent_name)，调度扇出按租户调用）
+    sched.set_context_builder(_scheduler_context_builder)
 
     db = SessionLocal()
     try:
@@ -1319,63 +1575,194 @@ def get_agent_config(agent_name: str) -> dict:
         db.close()
 
 
-async def trigger_agent(agent_name: str) -> str:
-    """手动触发 Agent 执行（根据执行模式处理）"""
+async def trigger_agent(agent_name: str, tenant_id: int = DEFAULT_TENANT_ID) -> str:
+    """手动触发 Agent 执行（根据执行模式处理）。
+
+    MT-P3：与调度链走同一身份通道——tenant_scope(tenant_id) 内执行，
+    load/resolve/build_context 全链下传 tenant_id（docs/23 §1.3）。
+    tenant_id 默认值保旧调用兼容；单租户直通模式与现状等价。
+    """
     start = time.monotonic()
     trace_id = f"man-{agent_name}-{int(time.time() * 1000)}"
     agent_cls = AGENT_REGISTRY.get(agent_name)
     if not agent_cls:
         raise ValueError(f"Agent {agent_name} 未注册实际实现")
 
-    with log_context(
-        trace_id=trace_id,
-        run_id=trace_id,
-        agent_name=agent_name,
-        event="trigger_agent",
-        tags={"trigger_source": "manual"},
-    ):
-        watchlist = load_watchlist_for_agent(agent_name)
-        logger.info(
-            f"[watchlist] Agent={agent_name} count={len(watchlist)} symbols={[s.symbol for s in watchlist]}"
-        )
-        if not watchlist:
-            return f"Agent {agent_name} 没有关联的自选股"
+    with tenant_scope(tenant_id):
+        with log_context(
+            trace_id=trace_id,
+            run_id=trace_id,
+            agent_name=agent_name,
+            event="trigger_agent",
+            tags={"trigger_source": "manual"},
+        ):
+            watchlist = load_watchlist_for_agent(agent_name, tenant_id=tenant_id)
+            logger.info(
+                f"[watchlist] Agent={agent_name} count={len(watchlist)} symbols={[s.symbol for s in watchlist]}"
+            )
+            if not watchlist:
+                return f"Agent {agent_name} 没有关联的自选股"
 
-        model, service = resolve_ai_model(agent_name)
-        channels = resolve_notify_channels(agent_name)
-        _log_trigger_info(agent_name, watchlist, model, service, channels)
+            model, service = resolve_ai_model(agent_name, tenant_id=tenant_id)
+            channels = resolve_notify_channels(agent_name, tenant_id=tenant_id)
+            _log_trigger_info(agent_name, watchlist, model, service, channels)
 
-        context = build_context(agent_name)
-        execution_mode = get_agent_execution_mode(agent_name)
-        agent_config = get_agent_config(agent_name)
+            context = build_context(agent_name, tenant_id=tenant_id)
+            execution_mode = get_agent_execution_mode(agent_name)
+            agent_config = get_agent_config(agent_name)
 
-        # 根据配置初始化 Agent
-        if agent_config:
-            agent = agent_cls(**agent_config)
-        else:
-            agent = agent_cls()
+            # 根据配置初始化 Agent
+            if agent_config:
+                agent = agent_cls(**agent_config)
+            else:
+                agent = agent_cls()
 
-        try:
-            if execution_mode == "single" and hasattr(agent, "run_single"):
-                # 单只模式：逐只股票分析
-                results = []
-                for stock in watchlist:
-                    result = await agent.run_single(context, stock.symbol)
-                    if result:
-                        results.append(f"{stock.name}: {result.content[:100]}...")
-                msg = "\n\n".join(results) if results else "无异动"
+            try:
+                if execution_mode == "single" and hasattr(agent, "run_single"):
+                    # 单只模式：逐只股票分析
+                    results = []
+                    for stock in watchlist:
+                        result = await agent.run_single(context, stock.symbol)
+                        if result:
+                            results.append(f"{stock.name}: {result.content[:100]}...")
+                    msg = "\n\n".join(results) if results else "无异动"
+                    record_agent_run(
+                        agent_name=agent_name,
+                        status="success",
+                        result=msg,
+                        duration_ms=int((time.monotonic() - start) * 1000),
+                        trace_id=trace_id,
+                        trigger_source="manual",
+                        model_label=context.model_label,
+                    )
+                    return msg
+                else:
+                    # 批量模式：所有股票一起分析
+                    result = await agent.run(context)
+                    raw = result.raw_data or {}
+                    record_agent_run(
+                        agent_name=agent_name,
+                        status="success",
+                        result=result.content,
+                        duration_ms=int((time.monotonic() - start) * 1000),
+                        trace_id=trace_id,
+                        trigger_source="manual",
+                        notify_attempted=(
+                            "notified" in raw
+                            or "notify_error" in raw
+                            or "notify_skipped" in raw
+                        ),
+                        notify_sent=bool(raw.get("notified", False)),
+                        model_label=context.model_label,
+                    )
+                    return result.content
+            except Exception as e:
                 record_agent_run(
                     agent_name=agent_name,
-                    status="success",
-                    result=msg,
+                    status="failed",
+                    error=str(e),
                     duration_ms=int((time.monotonic() - start) * 1000),
                     trace_id=trace_id,
                     trigger_source="manual",
                     model_label=context.model_label,
                 )
-                return msg
-            else:
-                # 批量模式：所有股票一起分析
+                raise
+
+
+async def trigger_agent_for_stock(
+    agent_name: str,
+    stock,
+    stock_agent_id: int | None = None,
+    bypass_throttle: bool = False,
+    bypass_market_hours: bool = False,
+    suppress_notify: bool = False,
+    trace_id: str | None = None,
+    force_refresh: bool = False,
+    tenant_id: int = DEFAULT_TENANT_ID,
+) -> dict:
+    """手动触发 Agent 执行（单只股票）。
+
+    MT-P3：tenant_id 走同一身份通道（tenant_scope 内执行，docs/23 §1.3）；
+    默认值保旧调用兼容；stock 入参的租户作用域解析由 web 层负责，
+    此处经 load_portfolio_for_stock 做防御性租户断言（P6）。
+    """
+    start = time.monotonic()
+    trace_id = trace_id or f"man-{agent_name}-{stock.symbol}-{int(time.time() * 1000)}"
+    agent_cls = AGENT_REGISTRY.get(agent_name)
+    if not agent_cls:
+        raise ValueError(f"Agent {agent_name} 未注册实际实现")
+
+    with tenant_scope(tenant_id):
+        settings = Settings()
+        proxy = _get_proxy() or settings.http_proxy
+
+        try:
+            market = MarketCode(stock.market)
+        except ValueError:
+            market = MarketCode.CN
+
+        stock_config = StockConfig(
+            symbol=stock.symbol,
+            name=stock.name,
+            market=market,
+        )
+
+        # 加载该股票的持仓信息（本租户账户）
+        portfolio = load_portfolio_for_stock(stock.id, tenant_id=tenant_id)
+
+        model, service = resolve_ai_model(agent_name, stock_agent_id, tenant_id=tenant_id)
+        channels = [] if suppress_notify else resolve_notify_channels(
+            agent_name, stock_agent_id, tenant_id=tenant_id
+        )
+        _log_trigger_info(agent_name, [stock], model, service, channels)
+
+        ai_client = _build_ai_client(model, service, proxy)
+        notifier = _build_notifier(channels, tenant_id=tenant_id)
+
+        model_label = f"{service.name}/{model.model}" if model and service else ""
+        config = AppConfig(settings=settings, watchlist=[stock_config])
+        context = AgentContext(
+            ai_client=ai_client,
+            notifier=notifier,
+            config=config,
+            portfolio=portfolio,
+            model_label=model_label,
+            suppress_notify=suppress_notify,
+        )
+        # MT-P3 P1 前置：动态携带 tenant_id（字段落地见 build_context 注释）。
+        try:
+            setattr(context, "tenant_id", tenant_id)
+        except Exception:
+            pass
+        # 暴露 trace_id / force_refresh 给 agent(供 TradingAgents 进度反馈 + 缓存控制使用)。
+        # AgentContext 不强制声明此字段,通过 setattr 注入,其他 agent 不受影响。
+        setattr(context, "_trace_id", trace_id)
+        setattr(context, "_force_refresh", force_refresh)
+
+        # 创建 agent，支持手动触发参数。TradingAgents 等新 agent 从 AgentConfig 读 config。
+        if agent_name == "intraday_monitor":
+            agent = agent_cls(
+                bypass_throttle=bypass_throttle,
+                bypass_market_hours=bypass_market_hours,
+            )
+        elif agent_name == "tradingagents":
+            # 从 AgentConfig.config 读取实例化参数
+            agent_kwargs = get_agent_config(agent_name) or {}
+            try:
+                agent = agent_cls(**agent_kwargs)
+            except TypeError:
+                agent = agent_cls()
+        else:
+            agent = agent_cls()
+
+        with log_context(
+            trace_id=trace_id,
+            run_id=trace_id,
+            agent_name=agent_name,
+            event="trigger_agent_for_stock",
+            tags={"trigger_source": "manual", "stock_symbol": stock.symbol},
+        ):
+            try:
                 result = await agent.run(context)
                 raw = result.raw_data or {}
                 record_agent_run(
@@ -1391,130 +1778,19 @@ async def trigger_agent(agent_name: str) -> str:
                         or "notify_skipped" in raw
                     ),
                     notify_sent=bool(raw.get("notified", False)),
-                    model_label=context.model_label,
+                    model_label=model_label,
                 )
-                return result.content
-        except Exception as e:
-            record_agent_run(
-                agent_name=agent_name,
-                status="failed",
-                error=str(e),
-                duration_ms=int((time.monotonic() - start) * 1000),
-                trace_id=trace_id,
-                trigger_source="manual",
-                model_label=context.model_label,
-            )
-            raise
-
-
-async def trigger_agent_for_stock(
-    agent_name: str,
-    stock,
-    stock_agent_id: int | None = None,
-    bypass_throttle: bool = False,
-    bypass_market_hours: bool = False,
-    suppress_notify: bool = False,
-    trace_id: str | None = None,
-    force_refresh: bool = False,
-) -> dict:
-    """手动触发 Agent 执行（单只股票）"""
-    start = time.monotonic()
-    trace_id = trace_id or f"man-{agent_name}-{stock.symbol}-{int(time.time() * 1000)}"
-    agent_cls = AGENT_REGISTRY.get(agent_name)
-    if not agent_cls:
-        raise ValueError(f"Agent {agent_name} 未注册实际实现")
-
-    settings = Settings()
-    proxy = _get_proxy() or settings.http_proxy
-
-    try:
-        market = MarketCode(stock.market)
-    except ValueError:
-        market = MarketCode.CN
-
-    stock_config = StockConfig(
-        symbol=stock.symbol,
-        name=stock.name,
-        market=market,
-    )
-
-    # 加载该股票的持仓信息
-    portfolio = load_portfolio_for_stock(stock.id)
-
-    model, service = resolve_ai_model(agent_name, stock_agent_id)
-    channels = [] if suppress_notify else resolve_notify_channels(agent_name, stock_agent_id)
-    _log_trigger_info(agent_name, [stock], model, service, channels)
-
-    ai_client = _build_ai_client(model, service, proxy)
-    notifier = _build_notifier(channels)
-
-    model_label = f"{service.name}/{model.model}" if model and service else ""
-    config = AppConfig(settings=settings, watchlist=[stock_config])
-    context = AgentContext(
-        ai_client=ai_client,
-        notifier=notifier,
-        config=config,
-        portfolio=portfolio,
-        model_label=model_label,
-        suppress_notify=suppress_notify,
-    )
-    # 暴露 trace_id / force_refresh 给 agent(供 TradingAgents 进度反馈 + 缓存控制使用)。
-    # AgentContext 不强制声明此字段,通过 setattr 注入,其他 agent 不受影响。
-    setattr(context, "_trace_id", trace_id)
-    setattr(context, "_force_refresh", force_refresh)
-
-    # 创建 agent，支持手动触发参数。TradingAgents 等新 agent 从 AgentConfig 读 config。
-    if agent_name == "intraday_monitor":
-        agent = agent_cls(
-            bypass_throttle=bypass_throttle,
-            bypass_market_hours=bypass_market_hours,
-        )
-    elif agent_name == "tradingagents":
-        # 从 AgentConfig.config 读取实例化参数
-        agent_kwargs = get_agent_config(agent_name) or {}
-        try:
-            agent = agent_cls(**agent_kwargs)
-        except TypeError:
-            agent = agent_cls()
-    else:
-        agent = agent_cls()
-
-    with log_context(
-        trace_id=trace_id,
-        run_id=trace_id,
-        agent_name=agent_name,
-        event="trigger_agent_for_stock",
-        tags={"trigger_source": "manual", "stock_symbol": stock.symbol},
-    ):
-        try:
-            result = await agent.run(context)
-            raw = result.raw_data or {}
-            record_agent_run(
-                agent_name=agent_name,
-                status="success",
-                result=result.content,
-                duration_ms=int((time.monotonic() - start) * 1000),
-                trace_id=trace_id,
-                trigger_source="manual",
-                notify_attempted=(
-                    "notified" in raw
-                    or "notify_error" in raw
-                    or "notify_skipped" in raw
-                ),
-                notify_sent=bool(raw.get("notified", False)),
-                model_label=model_label,
-            )
-        except Exception as e:
-            record_agent_run(
-                agent_name=agent_name,
-                status="failed",
-                error=str(e),
-                duration_ms=int((time.monotonic() - start) * 1000),
-                trace_id=trace_id,
-                trigger_source="manual",
-                model_label=model_label,
-            )
-            raise
+            except Exception as e:
+                record_agent_run(
+                    agent_name=agent_name,
+                    status="failed",
+                    error=str(e),
+                    duration_ms=int((time.monotonic() - start) * 1000),
+                    trace_id=trace_id,
+                    trigger_source="manual",
+                    model_label=model_label,
+                )
+                raise
 
     # 返回详细结果
     skipped = bool(result.raw_data.get("skipped", False))

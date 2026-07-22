@@ -12,9 +12,23 @@ from src.web.models import (
     NewsTopicSnapshot,
     StockContextSnapshot,
 )
+from src.web.tenant_context import DEFAULT_TENANT_ID, current_tenant
 from src.core.json_safe import to_jsonable
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_tenant_id(tenant_id: int | None) -> int:
+    """租户解析顺序（docs/25 §F12）：显式参数 → tenant_scope ctx → 默认租户 1。
+
+    单租户直通模式恒落 1（全量存量行 tenant_id=1），显式过滤行为等价。
+    """
+    if tenant_id is not None:
+        return int(tenant_id)
+    ctx = current_tenant()
+    if ctx is not None:
+        return int(ctx.tenant_id)
+    return DEFAULT_TENANT_ID
 
 
 def save_stock_context_snapshot(
@@ -25,7 +39,9 @@ def save_stock_context_snapshot(
     context_type: str,
     payload: dict,
     quality: dict | None = None,
+    tenant_id: int | None = None,
 ) -> bool:
+    tid = _resolve_tenant_id(tenant_id)
     db = SessionLocal()
     try:
         payload_safe = to_jsonable(payload or {})
@@ -33,6 +49,7 @@ def save_stock_context_snapshot(
         existing = (
             db.query(StockContextSnapshot)
             .filter(
+                StockContextSnapshot.tenant_id == tid,
                 StockContextSnapshot.symbol == symbol,
                 StockContextSnapshot.market == market,
                 StockContextSnapshot.snapshot_date == snapshot_date,
@@ -46,6 +63,7 @@ def save_stock_context_snapshot(
         else:
             db.add(
                 StockContextSnapshot(
+                    tenant_id=tid,
                     symbol=symbol,
                     market=market,
                     snapshot_date=snapshot_date,
@@ -71,11 +89,14 @@ def get_recent_stock_context_snapshots(
     context_type: str | None = None,
     days: int = 30,
     limit: int = 30,
+    tenant_id: int | None = None,
 ) -> list[StockContextSnapshot]:
+    tid = _resolve_tenant_id(tenant_id)
     db = SessionLocal()
     try:
         cutoff = (date.today() - timedelta(days=max(days, 1))).strftime("%Y-%m-%d")
         q = db.query(StockContextSnapshot).filter(
+            StockContextSnapshot.tenant_id == tid,
             StockContextSnapshot.symbol == symbol,
             StockContextSnapshot.market == market,
             StockContextSnapshot.snapshot_date >= cutoff,
@@ -100,12 +121,15 @@ def save_news_topic_snapshot(
     topics: list[str],
     sentiment: str,
     coverage: dict | None = None,
+    tenant_id: int | None = None,
 ) -> bool:
+    tid = _resolve_tenant_id(tenant_id)
     db = SessionLocal()
     try:
         existing = (
             db.query(NewsTopicSnapshot)
             .filter(
+                NewsTopicSnapshot.tenant_id == tid,
                 NewsTopicSnapshot.snapshot_date == snapshot_date,
                 NewsTopicSnapshot.window_days == window_days,
             )
@@ -129,6 +153,7 @@ def save_news_topic_snapshot(
         else:
             db.add(
                 NewsTopicSnapshot(
+                    tenant_id=tid,
                     snapshot_date=snapshot_date,
                     window_days=int(window_days),
                     symbols=payload["symbols"],
@@ -151,12 +176,17 @@ def save_news_topic_snapshot(
 def get_latest_news_topic_snapshot(
     *,
     window_days: int = 7,
+    tenant_id: int | None = None,
 ) -> NewsTopicSnapshot | None:
+    tid = _resolve_tenant_id(tenant_id)
     db = SessionLocal()
     try:
         return (
             db.query(NewsTopicSnapshot)
-            .filter(NewsTopicSnapshot.window_days == int(window_days))
+            .filter(
+                NewsTopicSnapshot.tenant_id == tid,
+                NewsTopicSnapshot.window_days == int(window_days),
+            )
             .order_by(NewsTopicSnapshot.snapshot_date.desc())
             .first()
         )
@@ -171,13 +201,16 @@ def save_agent_context_run(
     analysis_date: str,
     context_payload: dict,
     quality: dict | None = None,
+    tenant_id: int | None = None,
 ) -> bool:
+    tid = _resolve_tenant_id(tenant_id)
     db = SessionLocal()
     try:
         payload_safe = to_jsonable(context_payload or {})
         quality_safe = to_jsonable(quality or {})
         db.add(
             AgentContextRun(
+                tenant_id=tid,
                 agent_name=agent_name,
                 stock_symbol=stock_symbol or "*",
                 analysis_date=analysis_date,
@@ -201,11 +234,14 @@ def list_recent_agent_context_runs(
     stock_symbol: str | None = None,
     days: int = 30,
     limit: int = 50,
+    tenant_id: int | None = None,
 ) -> list[AgentContextRun]:
+    tid = _resolve_tenant_id(tenant_id)
     db = SessionLocal()
     try:
         cutoff = (date.today() - timedelta(days=max(days, 1))).strftime("%Y-%m-%d")
         q = db.query(AgentContextRun).filter(
+            AgentContextRun.tenant_id == tid,
             AgentContextRun.agent_name == agent_name,
             AgentContextRun.analysis_date >= cutoff,
         )
@@ -228,12 +264,15 @@ def save_agent_prediction_outcome(
     confidence: float | None = None,
     trigger_price: float | None = None,
     meta: dict | None = None,
+    tenant_id: int | None = None,
 ) -> bool:
+    tid = _resolve_tenant_id(tenant_id)
     db = SessionLocal()
     try:
         meta_safe = to_jsonable(meta or {})
         db.add(
             AgentPredictionOutcome(
+                tenant_id=tid,
                 agent_name=agent_name,
                 stock_symbol=stock_symbol,
                 stock_market=stock_market,
@@ -263,12 +302,17 @@ def mark_agent_prediction_outcome(
     outcome_price: float | None,
     outcome_return_pct: float | None,
     status: str = "evaluated",
+    tenant_id: int | None = None,
 ) -> bool:
+    tid = _resolve_tenant_id(tenant_id)
     db = SessionLocal()
     try:
         rec = (
             db.query(AgentPredictionOutcome)
-            .filter(AgentPredictionOutcome.id == int(record_id))
+            .filter(
+                AgentPredictionOutcome.id == int(record_id),
+                AgentPredictionOutcome.tenant_id == tid,
+            )
             .first()
         )
         if not rec:
@@ -291,12 +335,15 @@ def list_pending_prediction_outcomes(
     *,
     max_horizon_days: int = 10,
     limit: int = 300,
+    tenant_id: int | None = None,
 ) -> list[AgentPredictionOutcome]:
+    tid = _resolve_tenant_id(tenant_id)
     db = SessionLocal()
     try:
         today = date.today().strftime("%Y-%m-%d")
         q = db.query(AgentPredictionOutcome).filter(
             and_(
+                AgentPredictionOutcome.tenant_id == tid,
                 AgentPredictionOutcome.outcome_status == "pending",
                 AgentPredictionOutcome.horizon_days <= max_horizon_days,
                 AgentPredictionOutcome.prediction_date <= today,
@@ -321,12 +368,15 @@ def list_agent_prediction_outcomes(
     status: str | None = None,
     days: int = 90,
     limit: int = 200,
+    tenant_id: int | None = None,
 ) -> list[AgentPredictionOutcome]:
+    tid = _resolve_tenant_id(tenant_id)
     db = SessionLocal()
     try:
         cutoff = (date.today() - timedelta(days=max(days, 1))).strftime("%Y-%m-%d")
         q = db.query(AgentPredictionOutcome).filter(
-            AgentPredictionOutcome.prediction_date >= cutoff
+            AgentPredictionOutcome.tenant_id == tid,
+            AgentPredictionOutcome.prediction_date >= cutoff,
         )
         if agent_name:
             q = q.filter(AgentPredictionOutcome.agent_name == agent_name)
@@ -352,7 +402,15 @@ def cleanup_context_data(
     topic_days: int = 180,
     context_run_days: int = 180,
     outcome_days: int = 365,
+    tenant_id: int | None = None,
 ) -> dict:
+    """按日期清理过期上下文数据。
+
+    tenant_id 语义与其他函数不同（docs/24 §6 / docs/25 §F12）：
+    - None（默认）= 全局清理，不按租户过滤（单租户直通唯一路径，行为与现状等价）；
+    - 显式传入 = 仅清理该租户的行（多租户由调度器逐租户扇出调用，禁一次删全表）。
+    """
+    tid = int(tenant_id) if tenant_id is not None else None
     db = SessionLocal()
     deleted = {
         "stock_context_snapshots": 0,
@@ -374,25 +432,33 @@ def cleanup_context_data(
             date.today() - timedelta(days=max(1, int(outcome_days)))
         ).strftime("%Y-%m-%d")
 
-        deleted["stock_context_snapshots"] = (
-            db.query(StockContextSnapshot)
-            .filter(StockContextSnapshot.snapshot_date < snapshot_cutoff)
-            .delete(synchronize_session=False)
+        snapshot_q = db.query(StockContextSnapshot).filter(
+            StockContextSnapshot.snapshot_date < snapshot_cutoff
         )
-        deleted["news_topic_snapshots"] = (
-            db.query(NewsTopicSnapshot)
-            .filter(NewsTopicSnapshot.snapshot_date < topic_cutoff)
-            .delete(synchronize_session=False)
+        topic_q = db.query(NewsTopicSnapshot).filter(
+            NewsTopicSnapshot.snapshot_date < topic_cutoff
         )
-        deleted["agent_context_runs"] = (
-            db.query(AgentContextRun)
-            .filter(AgentContextRun.analysis_date < context_run_cutoff)
-            .delete(synchronize_session=False)
+        context_run_q = db.query(AgentContextRun).filter(
+            AgentContextRun.analysis_date < context_run_cutoff
         )
-        deleted["agent_prediction_outcomes"] = (
-            db.query(AgentPredictionOutcome)
-            .filter(AgentPredictionOutcome.prediction_date < outcome_cutoff)
-            .delete(synchronize_session=False)
+        outcome_q = db.query(AgentPredictionOutcome).filter(
+            AgentPredictionOutcome.prediction_date < outcome_cutoff
+        )
+        if tid is not None:
+            snapshot_q = snapshot_q.filter(StockContextSnapshot.tenant_id == tid)
+            topic_q = topic_q.filter(NewsTopicSnapshot.tenant_id == tid)
+            context_run_q = context_run_q.filter(AgentContextRun.tenant_id == tid)
+            outcome_q = outcome_q.filter(AgentPredictionOutcome.tenant_id == tid)
+
+        deleted["stock_context_snapshots"] = snapshot_q.delete(
+            synchronize_session=False
+        )
+        deleted["news_topic_snapshots"] = topic_q.delete(synchronize_session=False)
+        deleted["agent_context_runs"] = context_run_q.delete(
+            synchronize_session=False
+        )
+        deleted["agent_prediction_outcomes"] = outcome_q.delete(
+            synchronize_session=False
         )
         db.commit()
         return deleted

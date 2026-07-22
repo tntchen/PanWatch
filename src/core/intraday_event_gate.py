@@ -3,6 +3,13 @@
 Goal: avoid calling AI on every tick; only analyze when meaningful events happen.
 
 We persist a small per-symbol state under DATA_DIR.
+
+MT-P3（T7/R3，docs/23 §4）：状态文件 schema_version=2 分层——
+- ``market.{symbol}``：市场观测态（last_price 基线 / tech_sig / 观测记录），
+  全租户共享单份（行情是连续观测流，租户复制反而错误）；
+- ``tenants.{tenant_id}.{symbol}``：租户态（pb_fired 冷却），冷却键
+  ``方向:位名@价位`` 语义不变但归属租户命名空间，跨租户互吞消除。
+旧 v1 文件读取时惰性自愈迁移（pb_fired 归默认租户 1，原子写 + .v1.bak 备份）。
 """
 
 from __future__ import annotations
@@ -10,6 +17,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -17,6 +25,13 @@ from typing import Any
 from src.core.json_store import read_json, write_json_atomic
 
 logger = logging.getLogger(__name__)
+
+# 状态文件 schema 版本（v2 = 市场观测态 / 租户态分层，docs/23 §4.3）
+STATE_SCHEMA_VERSION = 2
+# v1→v2 迁移备份后缀（保留现场，幂等：已存在不覆盖）
+_V1_BACKUP_SUFFIX = ".v1.bak"
+# 默认租户（T18：单租户期全部存量状态归属租户 1）
+DEFAULT_TENANT_ID = 1
 
 
 def _data_dir() -> str:
@@ -29,6 +44,86 @@ def _state_path() -> str:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# 状态文件 v2 分层读写（MT-P3 / T7）
+# ---------------------------------------------------------------------------
+
+# 市场观测态字段（v1 symbol 级记录中归入 market 节的字段）
+_MARKET_FIELDS = ("last_price", "tech_sig", "last_seen_at", "change_pct", "volume_ratio")
+
+
+def _empty_state() -> dict[str, Any]:
+    return {"version": STATE_SCHEMA_VERSION, "market": {}, "tenants": {}}
+
+
+def _tenant_key(tenant_id: Any) -> str:
+    """租户态命名空间键；异常入参兜底默认租户（fail-soft，不阻断 agent）。"""
+    try:
+        return str(int(tenant_id))
+    except (TypeError, ValueError):
+        return str(DEFAULT_TENANT_ID)
+
+
+def _migrate_v1_state(path: str, v1: dict[str, Any]) -> dict[str, Any]:
+    """v1 → v2 一次性迁移：行情字段归 market 节，pb_fired 归默认租户 1。
+
+    原子写回 + 原文件备份为 ``<path>.v1.bak``（已存在备份不覆盖，幂等可重入）。
+    """
+    market: dict[str, Any] = {}
+    fired: dict[str, Any] = {}
+    for symbol, rec in v1.items():
+        if not isinstance(rec, dict):
+            continue
+        market[symbol] = {
+            k: rec[k] for k in _MARKET_FIELDS if k in rec
+        }
+        pb_fired = rec.get("pb_fired")
+        if isinstance(pb_fired, dict) and pb_fired:
+            fired[symbol] = {"pb_fired": pb_fired}
+    state: dict[str, Any] = {
+        "version": STATE_SCHEMA_VERSION,
+        "market": market,
+        "tenants": {str(DEFAULT_TENANT_ID): fired} if fired else {},
+    }
+    try:
+        backup = path + _V1_BACKUP_SUFFIX
+        if os.path.exists(path) and not os.path.exists(backup):
+            shutil.copy2(path, backup)
+    except Exception:
+        logger.exception("事件门状态 v1 备份失败 path=%s", path)
+    write_json_atomic(path, state)
+    logger.info("事件门状态文件已迁移 v1→v2：%s", path)
+    return state
+
+
+def migrate_state_file_to_v2(path: str | None = None) -> bool:
+    """显式一次性迁移入口（幂等）：已 v2 / 文件为空返回 False，迁移返回 True。"""
+    path = path or _state_path()
+    raw = read_json(path, default={})
+    if not isinstance(raw, dict) or not raw:
+        return False
+    if raw.get("version") == STATE_SCHEMA_VERSION:
+        return False
+    _migrate_v1_state(path, raw)
+    return True
+
+
+def _load_state(path: str) -> dict[str, Any]:
+    """读取状态文件并归一化为 v2 结构；v1 文件惰性自愈迁移（fail-soft）。"""
+    raw = read_json(path, default={})
+    if isinstance(raw, dict) and raw.get("version") == STATE_SCHEMA_VERSION:
+        market = raw.get("market")
+        tenants = raw.get("tenants")
+        return {
+            "version": STATE_SCHEMA_VERSION,
+            "market": market if isinstance(market, dict) else {},
+            "tenants": tenants if isinstance(tenants, dict) else {},
+        }
+    if isinstance(raw, dict) and raw:
+        return _migrate_v1_state(path, raw)
+    return _empty_state()
 
 
 def _safe_float(v: Any) -> float | None:
@@ -203,25 +298,34 @@ def extract_playbook_levels(payload: Any) -> list[PlaybookLevel]:
     return deduped
 
 
-def _load_playbook_levels(symbol: str) -> list[PlaybookLevel]:
-    """按 symbol 从库中读取激活 playbook 并提取关键价位；任何异常返回 []。"""
+def _load_playbook_levels(
+    symbol: str, tenant_id: int = DEFAULT_TENANT_ID
+) -> list[PlaybookLevel]:
+    """按 (tenant, symbol) 从库中读取本租户激活 playbook 并提取关键价位；任何异常返回 []。
+
+    MT-P3（T15）：Stock / StockPlaybook 均为租户私有表，``tenant_scope`` 下
+    do_orm_execute 机制点自动按 tenant 过滤，只读得到本租户 is_active 档案；
+    单租户直通模式（PANWATCH_SINGLE_TENANT='1'，默认）过滤短路，行为与改造前等价。
+    """
     try:
         from src.web.database import SessionLocal
         from src.web.models import Stock
+        from src.web.tenant_context import tenant_scope
 
         from src.core.playbook import load_active_playbook
 
-        db = SessionLocal()
-        try:
-            stock = db.query(Stock).filter(Stock.symbol == symbol).first()
-            if stock is None:
-                return []
-            playbook = load_active_playbook(db, stock.id)
-            if playbook is None or not isinstance(playbook.payload, dict):
-                return []
-            return extract_playbook_levels(playbook.payload)
-        finally:
-            db.close()
+        with tenant_scope(tenant_id):
+            db = SessionLocal()
+            try:
+                stock = db.query(Stock).filter(Stock.symbol == symbol).first()
+                if stock is None:
+                    return []
+                playbook = load_active_playbook(db, stock.id)
+                if playbook is None or not isinstance(playbook.payload, dict):
+                    return []
+                return extract_playbook_levels(playbook.payload)
+            finally:
+                db.close()
     except Exception:
         logger.exception("_load_playbook_levels 失败 symbol=%s", symbol)
         return []
@@ -258,21 +362,37 @@ def check_and_update(
     volume_threshold: float,
     current_price: float | None = None,
     playbook_levels: list[PlaybookLevel] | None = None,
+    tenant_id: int = DEFAULT_TENANT_ID,
 ) -> EventDecision:
     """Return whether we should analyze now, and persist latest state.
 
     新增可选参数（P3c，默认 None 时行为与改造前完全一致）：
     - current_price: 现价。提供时才启用方案价位穿越检测。
-    - playbook_levels: 方案关键价位列表。None 时按 symbol 自动从库中读取
-      激活 playbook（fail-soft，读不到视为无方案）；显式传列表（含空列表）
+    - playbook_levels: 方案关键价位列表。None 时按 (tenant, symbol) 自动从库中读取
+      本租户激活 playbook（fail-soft，读不到视为无方案）；显式传列表（含空列表）
       则直接使用、不再查库（测试/调用方自控）。
+
+    MT-P3（T7）新增 tenant_id（默认 1，单租户期行为与改造前等价）：
+    - 行情观测态（last_price 基线 / tech_sig / 观测记录）落 ``market.{symbol}``，
+      全租户共享单份；
+    - 穿越冷却 pb_fired 落 ``tenants.{tenant_id}.{symbol}``，冷却键
+      ``方向:位名@价位`` 语义不变，跨租户互不影响。
     """
 
     path = _state_path()
-    state: dict[str, Any] = read_json(path, default={})
-    rec: dict[str, Any] = state.get(symbol) if isinstance(state, dict) else None
+    state = _load_state(path)
+    market: dict[str, Any] = state["market"]
+    rec: dict[str, Any] = market.get(symbol)
     if not isinstance(rec, dict):
         rec = {}
+    tenants: dict[str, Any] = state["tenants"]
+    tenant_recs = tenants.get(_tenant_key(tenant_id))
+    if not isinstance(tenant_recs, dict):
+        tenant_recs = {}
+        tenants[_tenant_key(tenant_id)] = tenant_recs
+    t_rec: dict[str, Any] = tenant_recs.get(symbol)
+    if not isinstance(t_rec, dict):
+        t_rec = {}
 
     reasons: list[str] = []
 
@@ -300,13 +420,13 @@ def check_and_update(
     if cur_price is not None and cur_price > 0:
         if playbook_levels is None:
             try:
-                playbook_levels = _load_playbook_levels(symbol)
+                playbook_levels = _load_playbook_levels(symbol, tenant_id=tenant_id)
             except Exception:
                 logger.exception("playbook 价位加载失败 symbol=%s", symbol)
                 playbook_levels = []
         prev_price = _safe_float(rec.get("last_price"))
         if playbook_levels:
-            fired = rec.get("pb_fired")
+            fired = t_rec.get("pb_fired")
             if not isinstance(fired, dict):
                 fired = {}
             now = datetime.now(timezone.utc)
@@ -328,15 +448,16 @@ def check_and_update(
                     continue  # 冷却期内同向重复穿越不重复报
                 reasons.append(f"playbook_cross:{direction}{lv.name}@{lv.price:g}")
                 fired[cool_key] = now.isoformat()
-            rec["pb_fired"] = fired
+            t_rec["pb_fired"] = fired
+            tenant_recs[symbol] = t_rec
         rec["last_price"] = cur_price
 
-    # Persist latest observation
+    # Persist latest observation（市场观测态，全租户共享单份）
     rec["last_seen_at"] = _now_iso()
     rec["change_pct"] = cp
     rec["volume_ratio"] = vr
     rec["tech_sig"] = new_sig
-    state[symbol] = rec
+    market[symbol] = rec
     write_json_atomic(path, state)
 
     return EventDecision(should_analyze=bool(reasons), reasons=reasons)

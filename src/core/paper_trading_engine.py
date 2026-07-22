@@ -18,6 +18,13 @@ from src.web.models import (
     PaperTradingPosition,
     PaperTradingTrade,
     StrategySignalRun,
+    Tenant,
+)
+from src.web.tenant_context import (
+    DEFAULT_TENANT_ID,
+    current_tenant,
+    single_tenant_mode,
+    tenant_scope,
 )
 from src.core.backtest.cost_model import CostModel
 
@@ -150,26 +157,31 @@ def compute_market_cash(
     return initial_capital * ratio + realized_pnl - open_cost
 
 
-def market_realized_open(db: Session, market: str) -> tuple[float, float]:
-    """返回 (该市场已实现盈亏合计, 该市场未平仓持仓成本合计)。"""
-    realized = (
-        db.query(func.coalesce(func.sum(PaperTradingTrade.pnl), 0.0))
-        .filter(PaperTradingTrade.stock_market == market)
-        .scalar()
-    ) or 0.0
-    open_cost = (
-        db.query(
-            func.coalesce(
-                func.sum(PaperTradingPosition.entry_price * PaperTradingPosition.quantity),
-                0.0,
-            )
+def market_realized_open(
+    db: Session, market: str, tenant_id: int | None = None
+) -> tuple[float, float]:
+    """返回 (该市场已实现盈亏合计, 该市场未平仓持仓成本合计)。
+
+    func 聚合查询没有 ORM 实体，do_orm_execute 自动过滤覆盖不到，
+    必须显式按 tenant_id 过滤（单租户直通下全部行 tenant_id=1，结果等价）。
+    """
+    realized_q = db.query(func.coalesce(func.sum(PaperTradingTrade.pnl), 0.0)).filter(
+        PaperTradingTrade.stock_market == market
+    )
+    open_q = db.query(
+        func.coalesce(
+            func.sum(PaperTradingPosition.entry_price * PaperTradingPosition.quantity),
+            0.0,
         )
-        .filter(
-            PaperTradingPosition.status == "open",
-            PaperTradingPosition.stock_market == market,
-        )
-        .scalar()
-    ) or 0.0
+    ).filter(
+        PaperTradingPosition.status == "open",
+        PaperTradingPosition.stock_market == market,
+    )
+    if tenant_id is not None:
+        realized_q = realized_q.filter(PaperTradingTrade.tenant_id == tenant_id)
+        open_q = open_q.filter(PaperTradingPosition.tenant_id == tenant_id)
+    realized = realized_q.scalar() or 0.0
+    open_cost = open_q.scalar() or 0.0
     return float(realized), float(open_cost)
 
 
@@ -179,7 +191,8 @@ def market_available_cash(
     """某市场当前可用现金（用于建仓门槛与展示）。"""
     alloc = alloc or market_allocations_or_default(account)
     ratio = alloc.get(market, 0.0)
-    realized, open_cost = market_realized_open(db, market)
+    tenant_id = int(getattr(account, "tenant_id", None) or DEFAULT_TENANT_ID)
+    realized, open_cost = market_realized_open(db, market, tenant_id=tenant_id)
     return compute_market_cash(account.initial_capital, ratio, realized, open_cost)
 
 
@@ -234,13 +247,32 @@ def _serialize_signal(sig: StrategySignalRun) -> dict:
     }
 
 
+def _resolve_ctx_tenant_id() -> int:
+    """当前 ctx 的租户 id；无 ctx（裸脚本/单租户直通）兜底默认租户 1。"""
+    ctx = current_tenant()
+    return ctx.tenant_id if ctx is not None else DEFAULT_TENANT_ID
+
+
 class PaperTradingEngine:
     """模拟盘扫描引擎。"""
 
-    def _get_or_create_account(self, db: Session) -> PaperTradingAccount:
-        account = db.query(PaperTradingAccount).first()
+    def _get_or_create_account(
+        self, db: Session, tenant_id: int | None = None
+    ) -> PaperTradingAccount:
+        """按租户取/建模拟盘账户（T9 每租户一账户）。
+
+        单租户直通模式下 tenant_id 恒为 1，等价原 ``.first()`` 单例行为。
+        """
+        if tenant_id is None:
+            tenant_id = _resolve_ctx_tenant_id()
+        account = (
+            db.query(PaperTradingAccount)
+            .filter(PaperTradingAccount.tenant_id == tenant_id)
+            .first()
+        )
         if not account:
             account = PaperTradingAccount(
+                tenant_id=tenant_id,
                 initial_capital=1000000.0,
                 current_capital=1000000.0,
                 peak_capital=1000000.0,
@@ -382,6 +414,8 @@ class PaperTradingEngine:
                 target_price = round(entry_price * 1.15, 4)
 
             pos = PaperTradingPosition(
+                tenant_id=account.tenant_id,
+                account_id=account.id,
                 stock_symbol=sig.stock_symbol,
                 stock_market=sig.stock_market,
                 stock_name=sig.stock_name or "",
@@ -446,6 +480,8 @@ class PaperTradingEngine:
             holding_days = max(0, (now - opened).days)
 
         trade = PaperTradingTrade(
+            tenant_id=pos.tenant_id or account.tenant_id,
+            account_id=pos.account_id or account.id,
             stock_symbol=pos.stock_symbol,
             stock_market=pos.stock_market,
             stock_name=pos.stock_name or "",
@@ -616,33 +652,101 @@ class PaperTradingEngine:
             if drawdown > account.max_drawdown_pct:
                 account.max_drawdown_pct = round(drawdown, 2)
 
+    def _scan_account(self, db: Session, account: PaperTradingAccount) -> dict:
+        """评估单个账户（建仓 + 平仓），返回序列化事件。调用方负责租户作用域。"""
+        opened, new_keys, entry_events = self._check_entries(db, account)
+        closed, exit_events = self._check_exits(db, account, skip_keys=new_keys)
+
+        # 在 db.close() 前将 ORM 对象序列化为 dict，避免 detached 问题
+        serialized_entries = [
+            {"pos_data": _serialize_position(pos), "sig_data": _serialize_signal(sig) if sig else None}
+            for pos, sig in entry_events
+        ]
+        serialized_exits = [
+            {"pos_data": _serialize_position(pos), "trade_data": _serialize_trade(trade)}
+            for pos, trade in exit_events
+        ]
+
+        return {
+            "status": "ok",
+            "opened": opened,
+            "closed": closed,
+            "entry_events": serialized_entries,
+            "exit_events": serialized_exits,
+        }
+
+    def _list_scan_tenant_ids(self, db: Session) -> list[int]:
+        """多租户扫描的租户集合：active 租户 ∪ 已有账户租户（确定性排序）。"""
+        ids: set[int] = set()
+        try:
+            ids |= {
+                t
+                for (t,) in db.query(Tenant.id)
+                .filter(Tenant.status == "active")
+                .all()
+            }
+        except Exception:
+            pass
+        ids |= {t for (t,) in db.query(PaperTradingAccount.tenant_id).all()}
+        if not ids:
+            ids = {DEFAULT_TENANT_ID}
+        return sorted(ids)
+
     def _scan_sync(self) -> dict:
-        """同步扫描（在线程中执行）。"""
+        """同步扫描（在线程中执行）。
+
+        单租户直通：维持原单账户行为，返回结构与历史完全一致。
+        多租户：单 job 内串行遍历全部租户账户（T17 不新增 job，T9 每租户
+        一账户），每租户 ``tenant_scope`` 内独立评估，单租户失败不阻断其余。
+        """
         db = SessionLocal()
         try:
-            account = self._get_or_create_account(db)
-            if not account.enabled:
-                return {"status": "disabled"}
+            if single_tenant_mode():
+                account = self._get_or_create_account(db, DEFAULT_TENANT_ID)
+                if not account.enabled:
+                    return {"status": "disabled"}
+                return self._scan_account(db, account)
 
-            opened, new_keys, entry_events = self._check_entries(db, account)
-            closed, exit_events = self._check_exits(db, account, skip_keys=new_keys)
-
-            # 在 db.close() 前将 ORM 对象序列化为 dict，避免 detached 问题
-            serialized_entries = [
-                {"pos_data": _serialize_position(pos), "sig_data": _serialize_signal(sig) if sig else None}
-                for pos, sig in entry_events
-            ]
-            serialized_exits = [
-                {"pos_data": _serialize_position(pos), "trade_data": _serialize_trade(trade)}
-                for pos, trade in exit_events
-            ]
+            tenant_results: list[dict] = []
+            opened_total = 0
+            closed_total = 0
+            entry_events_all: list[dict] = []
+            exit_events_all: list[dict] = []
+            for tid in self._list_scan_tenant_ids(db):
+                try:
+                    with tenant_scope(tid):
+                        account = self._get_or_create_account(db, tid)
+                        if not account.enabled:
+                            tenant_results.append(
+                                {"tenant_id": tid, "status": "disabled"}
+                            )
+                            continue
+                        r = self._scan_account(db, account)
+                except Exception as e:
+                    db.rollback()
+                    logger.exception("[模拟盘] 租户 %s 扫描异常: %s", tid, e)
+                    tenant_results.append(
+                        {"tenant_id": tid, "status": "error", "error": str(e)}
+                    )
+                    continue
+                r["tenant_id"] = tid
+                for evt in r["entry_events"]:
+                    evt["tenant_id"] = tid
+                for evt in r["exit_events"]:
+                    evt["tenant_id"] = tid
+                opened_total += r["opened"]
+                closed_total += r["closed"]
+                entry_events_all.extend(r["entry_events"])
+                exit_events_all.extend(r["exit_events"])
+                tenant_results.append(r)
 
             return {
                 "status": "ok",
-                "opened": opened,
-                "closed": closed,
-                "entry_events": serialized_entries,
-                "exit_events": serialized_exits,
+                "opened": opened_total,
+                "closed": closed_total,
+                "entry_events": entry_events_all,
+                "exit_events": exit_events_all,
+                "tenants": tenant_results,
             }
         except Exception as e:
             logger.exception(f"[模拟盘] 扫描异常: {e}")
@@ -710,24 +814,32 @@ class PaperTradingEngine:
         return result
 
     async def _send_notifications(self, result: dict) -> None:
-        """从扫描结果中取出序列化事件，发送通知。"""
+        """从扫描结果中取出序列化事件，发送通知（多租户按事件归属租户路由）。"""
         try:
             from src.core.paper_trading_notifier import notify_entry, notify_exit
 
             for evt in result.pop("entry_events", []):
-                await notify_entry(evt["pos_data"], evt.get("sig_data"))
+                await notify_entry(
+                    evt["pos_data"], evt.get("sig_data"), tenant_id=evt.get("tenant_id")
+                )
             for evt in result.pop("exit_events", []):
-                await notify_exit(evt["pos_data"], evt["trade_data"])
+                await notify_exit(
+                    evt["pos_data"], evt["trade_data"], tenant_id=evt.get("tenant_id")
+                )
         except Exception:
             logger.exception("[模拟盘] 通知发送失败")
 
     def reset_account(self) -> dict:
-        """重置模拟盘（清空所有数据）。"""
+        """重置模拟盘（清空当前租户数据）。"""
         db = SessionLocal()
         try:
             db.query(PaperTradingPosition).delete()
             db.query(PaperTradingTrade).delete()
-            account = db.query(PaperTradingAccount).first()
+            account = (
+                db.query(PaperTradingAccount)
+                .filter(PaperTradingAccount.tenant_id == _resolve_ctx_tenant_id())
+                .first()
+            )
             if account:
                 account.current_capital = account.initial_capital
                 account.total_pnl = 0.0

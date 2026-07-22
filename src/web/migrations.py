@@ -2628,6 +2628,129 @@ def _m122_tenant_reconciliation(conn: Connection) -> None:
         raise RuntimeError("v122 多租户对账失败: " + "；".join(failures))
 
 
+#: v123 重建规格：strategy_signal_runs 的 UQ 补 tenant_id 前缀（MT-P3 集成裁决，
+#: docs/26-J2 落地时遗漏——两租户同日同标的同策略信号会在
+#: uq_strategy_signal_daily_unique 上冲突丢行）。v121 已发布不可改（checksum 钉死）。
+_V123_REBUILD_SPEC = _RebuildSpec(
+    table="strategy_signal_runs",
+    create_sql="""
+CREATE TABLE strategy_signal_runs__new (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id INTEGER NOT NULL DEFAULT 1,
+  snapshot_date VARCHAR NOT NULL,
+  stock_symbol VARCHAR NOT NULL,
+  stock_market VARCHAR NOT NULL DEFAULT 'CN',
+  stock_name VARCHAR DEFAULT '',
+  strategy_code VARCHAR NOT NULL,
+  strategy_name VARCHAR DEFAULT '',
+  strategy_version VARCHAR DEFAULT 'v1',
+  risk_level VARCHAR DEFAULT 'medium',
+  source_pool VARCHAR DEFAULT 'watchlist',
+  score FLOAT NOT NULL DEFAULT 0,
+  rank_score FLOAT NOT NULL DEFAULT 0,
+  confidence FLOAT,
+  status VARCHAR DEFAULT 'active',
+  action VARCHAR DEFAULT 'watch',
+  action_label VARCHAR DEFAULT '观望',
+  signal VARCHAR DEFAULT '',
+  reason VARCHAR DEFAULT '',
+  evidence JSON,
+  holding_days INTEGER DEFAULT 3,
+  entry_low FLOAT,
+  entry_high FLOAT,
+  stop_loss FLOAT,
+  target_price FLOAT,
+  invalidation VARCHAR DEFAULT '',
+  plan_quality INTEGER DEFAULT 0,
+  source_agent VARCHAR DEFAULT '',
+  source_suggestion_id INTEGER,
+  source_candidate_id INTEGER,
+  trace_id VARCHAR DEFAULT '',
+  is_holding_snapshot BOOLEAN DEFAULT 0,
+  context_quality_score FLOAT,
+  payload JSON,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT uq_strategy_signal_daily_unique UNIQUE (tenant_id, snapshot_date, stock_symbol, stock_market, strategy_code, source_candidate_id)
+)
+""",
+    columns=(
+        "id",
+        "tenant_id",
+        "snapshot_date",
+        "stock_symbol",
+        "stock_market",
+        "stock_name",
+        "strategy_code",
+        "strategy_name",
+        "strategy_version",
+        "risk_level",
+        "source_pool",
+        "score",
+        "rank_score",
+        "confidence",
+        "status",
+        "action",
+        "action_label",
+        "signal",
+        "reason",
+        "evidence",
+        "holding_days",
+        "entry_low",
+        "entry_high",
+        "stop_loss",
+        "target_price",
+        "invalidation",
+        "plan_quality",
+        "source_agent",
+        "source_suggestion_id",
+        "source_candidate_id",
+        "trace_id",
+        "is_holding_snapshot",
+        "context_quality_score",
+        "payload",
+        "created_at",
+        "updated_at",
+    ),
+    done_marker="tenant_id, snapshot_date, stock_symbol, stock_market, strategy_code, source_candidate_id",
+    indexes=(
+        (
+            "ix_strategy_signal_runs_tenant_id",
+            "CREATE INDEX ix_strategy_signal_runs_tenant_id ON strategy_signal_runs(tenant_id)",
+        ),
+        (
+            "ix_strategy_signal_snapshot_rank",
+            "CREATE INDEX ix_strategy_signal_snapshot_rank ON strategy_signal_runs(snapshot_date, rank_score)",
+        ),
+        (
+            "ix_strategy_signal_strategy_market",
+            "CREATE INDEX ix_strategy_signal_strategy_market ON strategy_signal_runs(strategy_code, stock_market)",
+        ),
+        (
+            "ix_strategy_signal_status",
+            "CREATE INDEX ix_strategy_signal_status ON strategy_signal_runs(status, updated_at)",
+        ),
+    ),
+)
+
+
+def _m123_strategy_signal_uq_tenant(conn: Connection) -> None:
+    """v123：strategy_signal_runs UQ 重建为含 tenant_id（MT-P3 集成裁决）。
+
+    同 v121 以 transactional=False 注册：strategy_outcomes 以 FK CASCADE 挂在
+    本表上，须先关 PRAGMA foreign_keys 再 DROP，否则级联误删子表。
+    done_marker 匹配重建后的 UQ 定义（幂等：已重建则跳过）。
+    """
+    conn.execute(text("PRAGMA foreign_keys=OFF"))
+    conn.commit()
+    try:
+        with conn.begin():
+            _apply_rebuild(conn, _V123_REBUILD_SPEC)
+    finally:
+        conn.execute(text("PRAGMA foreign_keys=ON"))
+        conn.commit()
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(101, "agent_config_kind_and_visibility", _m101_agent_config_kind),
     Migration(102, "backfill_agent_kind_data", _m102_backfill_agent_kind),
@@ -2656,6 +2779,12 @@ MIGRATIONS: tuple[Migration, ...] = (
         transactional=False,
     ),
     Migration(122, "tenant_reconciliation", _m122_tenant_reconciliation),
+    Migration(
+        123,
+        "strategy_signal_uq_tenant",
+        _m123_strategy_signal_uq_tenant,
+        transactional=False,
+    ),
 )
 
 

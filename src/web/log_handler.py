@@ -1,4 +1,10 @@
-"""Custom logging handler that writes log entries to SQLite."""
+"""Custom logging handler that writes log entries to SQLite.
+
+MT-P3（docs/23 §1.2-P21 / docs/26-J11）：emit 时点从 tenant_scope
+contextvar 捕获 tenant_id 写入 log_entries（Timer 线程 flush 时
+contextvar 已不可考，必须在 emit 捕获）；系统级日志（无 ctx）归 tenant_id=0。
+bulk_insert_mappings 不触发 do_orm_execute，故显式写列（docs/25 §F12）。
+"""
 
 import logging
 import threading
@@ -8,6 +14,7 @@ from sqlalchemy import or_
 
 from src.web.database import SessionLocal
 from src.web.models import LogEntry
+from src.web.tenant_context import current_tenant
 
 MAX_LOG_ENTRIES_TOTAL = 120_000
 MAX_INFRA_LOG_ENTRIES = 30_000
@@ -24,6 +31,24 @@ INFRA_LOGGER_PREFIXES = (
 )
 
 _ACTIVE_HANDLER = None
+
+
+def _capture_tenant_id(record: logging.LogRecord) -> int:
+    """emit 时点捕获租户身份（flush 在 Timer 线程，contextvar 不可考）。
+
+    解析顺序：record.tenant_id（log_context 注入，预留）→ tenant_scope ctx
+    → 0（系统级日志，docs/26-J11）。绝不抛异常——日志链路 fail-soft。
+    """
+    try:
+        tid = getattr(record, "tenant_id", None)
+        if isinstance(tid, int):
+            return tid
+        ctx = current_tenant()
+        if ctx is not None:
+            return int(ctx.tenant_id)
+    except Exception:
+        pass
+    return 0
 
 
 def get_log_handler_stats() -> dict:
@@ -84,6 +109,7 @@ class DBLogHandler(logging.Handler):
                 "tags": tags,
                 "notify_status": str(getattr(record, "notify_status", "") or "")[:32],
                 "notify_reason": str(getattr(record, "notify_reason", "") or "")[:255],
+                "tenant_id": _capture_tenant_id(record),
             }
             with self._lock:
                 if len(self._buffer) >= MAX_BUFFERED_ENTRIES:

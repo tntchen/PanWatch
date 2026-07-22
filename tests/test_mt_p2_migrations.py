@@ -70,7 +70,7 @@ def test_fresh_db_full_chain_idempotent(tmp_path):
         ).scalar() == 1
         # 对账：FK 干净
         assert conn.execute(text("PRAGMA foreign_key_check")).fetchall() == []
-        # 账本 120–122 成功
+        # 账本 120–123 成功
         rows = conn.execute(
             text(
                 "SELECT version, success FROM schema_migrations "
@@ -81,6 +81,7 @@ def test_fresh_db_full_chain_idempotent(tmp_path):
             (120, 1),
             (121, 1),
             (122, 1),
+            (123, 1),
         ]
     engine.dispose()
 

@@ -7,9 +7,14 @@ from src.core.ai_client import AIClient
 from src.core.notifier import NotifierManager
 from src.config import AppConfig, StockConfig
 from src.models.market import MarketCode
-from src.core.notify_dedupe import build_notify_dedupe_key, check_and_mark_notify
+from src.core.notify_dedupe import (
+    build_notify_dedupe_key,
+    build_notify_scope,
+    check_and_mark_notify,
+)
 from src.core.notify_policy import NotifyPolicy
 from src.core.log_context import log_context
+from src.web.tenant_context import DEFAULT_TENANT_ID, current_tenant
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +132,9 @@ class AgentContext:
     model_label: str = ""  # e.g. "智谱/glm-4-flash"
     notify_policy: NotifyPolicy | None = None
     suppress_notify: bool = False
+    # MT-P3（docs/23 §1.2-P1，T16/T18）：租户身份载体，全链路的 tenant 最终落在此。
+    # 默认 1 = 单租户直通，与单用户行为等价；多租户由 server.build_context 显式注入。
+    tenant_id: int = DEFAULT_TENANT_ID
 
     @property
     def watchlist(self) -> list[StockConfig]:
@@ -228,6 +236,19 @@ class BaseAgent(ABC):
                 return default
         return default
 
+    def _resolve_tenant_id(self, context: AgentContext) -> int:
+        """租户解析顺序：AgentContext.tenant_id → tenant_scope ctx → 默认租户 1。
+
+        单租户直通模式恒落 1（docs/23 §3.2，T18）。
+        """
+        tid = getattr(context, "tenant_id", None)
+        if isinstance(tid, int) and tid > 0:
+            return tid
+        ctx = current_tenant()
+        if ctx is not None:
+            return ctx.tenant_id
+        return DEFAULT_TENANT_ID
+
     async def run(self, context: AgentContext) -> AnalysisResult:
         """标准执行流程"""
         logger.info(f"Agent [{self.display_name}] 开始执行")
@@ -268,16 +289,20 @@ class BaseAgent(ABC):
 
                 # Global notification dedupe (idempotency):
                 # avoids repeated pushes when an agent is triggered multiple times.
+                # MT-P3（docs/23 §3 / docs/26-J4）：scope 编入 tenant 前缀，
+                # 两租户同 watchlist 同内容不再互吞；UQ 不重建。
+                tenant_id = self._resolve_tenant_id(context)
                 ttl = self._notify_dedupe_ttl_minutes(context)
                 dedupe_key = build_notify_dedupe_key(
                     self.name, result.title, result.notify_content or result.content
                 )
-                scope = f"__notify__:{dedupe_key}"
+                scope = build_notify_scope(tenant_id, dedupe_key)
                 allowed = check_and_mark_notify(
                     agent_name=self.name,
                     scope=scope,
                     ttl_minutes=ttl,
                     mark=False,
+                    tenant_id=tenant_id,
                 )
                 if not allowed:
                     with log_context(
@@ -325,6 +350,7 @@ class BaseAgent(ABC):
                         scope=scope,
                         ttl_minutes=ttl,
                         mark=True,
+                        tenant_id=tenant_id,
                     )
                 else:
                     notify_error = notify_result.get("error") or "未知错误"

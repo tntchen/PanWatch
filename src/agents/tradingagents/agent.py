@@ -23,8 +23,9 @@ from src.agents.tradingagents.cost_tracker import (
 from src.agents.tradingagents.langchain_compat import apply_compat_patches
 from src.agents.tradingagents.llm_adapter import (
     VALID_ANALYSTS,
+    apply_ta_api_key_patch,
     build_ta_llm_config,
-    inject_api_key_env,
+    ta_api_key_context,
 )
 from src.agents.tradingagents.portfolio_context import (
     build_portfolio_context,
@@ -433,7 +434,8 @@ class TradingAgentsAgent(BaseAgent):
         """在 worker 线程跑同步 TradingAgents 流程。
 
         步骤:
-        1. inject_api_key_env 注入 API key 到环境变量
+        1. apply_ta_api_key_patch + ta_api_key_context 按调用传 API key
+           （风险 #20：不写进程 env，key 从调用方 ai_client 配置取）
         2. patch_route_to_vendor 让 A 股请求路由到 PanWatch 数据
         3. TradingAgentsGraph.propagate 跑 3-5 分钟
         4. 返回 decision + final_state + cost_usd
@@ -444,11 +446,15 @@ class TradingAgentsAgent(BaseAgent):
         # 应用 LangChain 兼容性补丁:让小模型 (Qwen 7B 等) 返回的
         # tool_calls.args 字符串被自动转 dict。
         apply_compat_patches()
-        inject_api_key_env(ai_client)
+        apply_ta_api_key_patch()
 
         # patch + 数据上下文,确保 TradingAgents 调 route_to_vendor 时拿到 PanWatch 数据
         trace_id_for_ctx = getattr(progress_handler, "trace_id", "") if progress_handler else ""
-        with patch_route_to_vendor(), panwatch_data_context(panwatch_data, trace_id=trace_id_for_ctx):
+        with (
+            ta_api_key_context(getattr(ai_client, "api_key", None)),
+            patch_route_to_vendor(),
+            panwatch_data_context(panwatch_data, trace_id=trace_id_for_ctx),
+        ):
             graph = TradingAgentsGraph(
                 selected_analysts=ta_config["selected_analysts"],
                 debug=False,

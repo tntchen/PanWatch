@@ -8,10 +8,21 @@ from sqlalchemy import and_, func, or_
 
 from src.web.database import SessionLocal
 from src.web.models import StockSuggestion
+from src.web.tenant_context import (
+    DEFAULT_TENANT_ID,
+    current_tenant,
+    single_tenant_mode,
+)
 from src.core.timezone import utc_now, to_iso_with_tz
 from src.core.json_safe import to_jsonable
 
 logger = logging.getLogger(__name__)
+
+
+def _current_tenant_id() -> int:
+    """当前 ctx 的租户 id；无 ctx（裸脚本/单租户直通）兜底默认租户 1。"""
+    ctx = current_tenant()
+    return ctx.tenant_id if ctx is not None else DEFAULT_TENANT_ID
 
 
 def _norm_text(s: str) -> str:
@@ -81,6 +92,8 @@ def save_suggestion(
     db = SessionLocal()
     try:
         market = (stock_market or "CN").strip().upper() or "CN"
+        # 建议归属租户（风险 #19：去重键加 tenant 维度，跨租户不互吞）
+        tenant_id = _current_tenant_id()
 
         # 计算过期时间（使用 UTC）
         if expires_hours is None:
@@ -96,13 +109,19 @@ def save_suggestion(
         # Dedupe: if the latest suggestion from the same agent is essentially the same,
         # do not create a new row. This prevents "AI 建议反复" in the UI.
         try:
-            latest = (
-                db.query(StockSuggestion)
-                .filter(
-                    StockSuggestion.stock_symbol == stock_symbol,
-                    StockSuggestion.stock_market == market,
-                    StockSuggestion.agent_name == agent_name,
+            dedupe_query = db.query(StockSuggestion).filter(
+                StockSuggestion.stock_symbol == stock_symbol,
+                StockSuggestion.stock_market == market,
+                StockSuggestion.agent_name == agent_name,
+            )
+            if not single_tenant_mode():
+                # 多租户：去重只看本租户的建议（单租户直通下不加谓词，
+                # 保持与原查询完全一致）
+                dedupe_query = dedupe_query.filter(
+                    StockSuggestion.tenant_id == tenant_id
                 )
+            latest = (
+                dedupe_query
                 .order_by(StockSuggestion.created_at.desc(), StockSuggestion.id.desc())
                 .first()
             )
@@ -111,6 +130,12 @@ def save_suggestion(
                 latest_created = latest.created_at
                 if latest_created.tzinfo is None:
                     latest_created = latest_created.replace(tzinfo=timezone.utc)
+
+                # SQLite DateTime 读回为 naive，比较前统一归一为 aware UTC，
+                # 否则 naive < aware 抛 TypeError 被静默吞掉，去重失效
+                latest_expires = latest.expires_at
+                if latest_expires is not None and latest_expires.tzinfo is None:
+                    latest_expires = latest_expires.replace(tzinfo=timezone.utc)
 
                 window = timedelta(minutes=_dedupe_window_minutes(agent_name))
                 same_key = (
@@ -121,7 +146,7 @@ def save_suggestion(
 
                 if same_key and (now - latest_created) <= window:
                     # Extend expiry (keep the first message to avoid churn).
-                    if not latest.expires_at or latest.expires_at < expires_at:
+                    if not latest_expires or latest_expires < expires_at:
                         latest.expires_at = expires_at
                     if not (latest.stock_name or "") and stock_name:
                         latest.stock_name = stock_name
@@ -150,7 +175,7 @@ def save_suggestion(
                     )
                     if (now - latest_created) <= change_window and new_r < old_r:
                         # Keep the previous (more severe) action; extend expiry.
-                        if not latest.expires_at or latest.expires_at < expires_at:
+                        if not latest_expires or latest_expires < expires_at:
                             latest.expires_at = expires_at
                         if not (latest.stock_name or "") and stock_name:
                             latest.stock_name = stock_name
@@ -167,6 +192,7 @@ def save_suggestion(
 
         # 创建新建议
         suggestion = StockSuggestion(
+            tenant_id=tenant_id,
             stock_symbol=stock_symbol,
             stock_market=market,
             stock_name=stock_name,
