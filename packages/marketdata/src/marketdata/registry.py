@@ -40,6 +40,7 @@ from marketdata.vendors.news import (
 from marketdata.vendors.northbound import HexinNorthboundVendor
 from marketdata.vendors.sina import SinaQuoteVendor
 from marketdata.vendors.tencent import TencentQuoteVendor
+from marketdata.vendors.tushare import TushareKlineVendor
 from marketdata.vendors.yfinance import YFinanceQuoteVendor
 
 # 各数据类型 → {vendor name: vendor 类}。注意:vendor 的 import 本身是廉价的
@@ -56,6 +57,7 @@ VENDOR_CLASSES_BY_TYPE: dict[str, dict[str, type]] = {
         "stooq": StooqKlineVendor,
         "eastmoney": EastmoneyKlineVendor,
         "yahoo": YahooKlineVendor,
+        "tushare": TushareKlineVendor,
     },
     "capital_flow": {
         "eastmoney": EastmoneyCapitalFlowVendor,

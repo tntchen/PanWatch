@@ -89,13 +89,15 @@ class TestKlineSourceTestPath(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_unbacked_provider_returns_clean_error_not_raise(self):
-        """kline 测试:provider 在包内无对应 vendor(如 tushare)应返回明确 error,不抛异常"""
+        """kline 测试:provider 在包内无对应 vendor(如 nonexistent_vendor_xyz)应返回明确 error,不抛异常"""
         manager = DataCollectorManager()
-        source = _make_source(type="kline", provider="tushare", test_symbols=["600519"])
+        source = _make_source(
+            type="kline", provider="nonexistent_vendor_xyz", test_symbols=["600519"]
+        )
         result = await manager._test_kline_source(source, source.test_symbols)
 
         self.assertFalse(result.success)
-        self.assertIn("tushare", result.error)
+        self.assertIn("nonexistent_vendor_xyz", result.error)
         self.assertEqual(result.count, 0)
 
 

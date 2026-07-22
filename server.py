@@ -435,6 +435,20 @@ DATA_SOURCE_SEEDS: list[dict] = [
             "test_symbols": ["600519", "00700"],
         },
         {
+            "name": "Tushare K线",
+            "type": "kline",
+            "provider": "tushare",
+            "config": {
+                "token": "",
+                "description": "Tushare A股日线(需 token,软依赖 pip install tushare;"
+                "token 也可由环境变量 TUSHARE_TOKEN 提供)。仅 A 股,CN 第二兜底。",
+            },
+            "enabled": False,  # 需 token,默认关,用户配好 token 再开
+            "priority": 10,  # 东方财富(5)之后、Stooq(15)之前 → CN 兜底链
+            "supports_batch": False,
+            "test_symbols": ["600519"],
+        },
+        {
             "name": "Stooq K线",
             "type": "kline",
             "provider": "stooq",

@@ -26,7 +26,8 @@ def _make_session():
 
 
 def test_reconcile_deletes_orphans_keeps_user_custom_and_fills_missing_defaults():
-    """对账:删孤儿(news/cls、kline/tushare),保留用户自定义 quote/tencent(config/priority 原样),补回缺失默认。"""
+    """对账:删孤儿(news/cls),保留用户自定义 quote/tencent(config/priority 原样)
+    和已补回 seed 的 kline/tushare(不再是孤儿),补回缺失默认。"""
     db = _make_session()
 
     # 孤儿 1:news/cls —— 既不在 marketdata 包内引擎集合,也不在当前 seed 列表里
@@ -42,7 +43,7 @@ def test_reconcile_deletes_orphans_keeps_user_custom_and_fills_missing_defaults(
             test_symbols=[],
         )
     )
-    # 孤儿 2:kline/tushare —— Step3 已从 seed 里删除,包内也没有对应 vendor
+    # 合法行:kline/tushare 已补回 seed(包内也有 vendor)——不再孤儿,用户旧配置应原样保留
     db.add(
         DataSource(
             name="Tushare K线",
@@ -77,7 +78,11 @@ def test_reconcile_deletes_orphans_keeps_user_custom_and_fills_missing_defaults(
 
     # 孤儿被删
     assert ("news", "cls") not in remaining
-    assert ("kline", "tushare") not in remaining
+
+    # kline/tushare 已在 seed 内,不再是孤儿 → 保留,且用户旧配置原样不动
+    kept_tushare = remaining[("kline", "tushare")]
+    assert kept_tushare.config == {"token": "", "description": "旧配置"}
+    assert kept_tushare.priority == 10
 
     # 用户自定义配置原样保留
     kept = remaining[("quote", "tencent")]
@@ -90,7 +95,7 @@ def test_reconcile_deletes_orphans_keeps_user_custom_and_fills_missing_defaults(
     # summary 里能看到删除记录
     deleted_pairs = {(d["type"], d["provider"]) for d in result["deleted"]}
     assert ("news", "cls") in deleted_pairs
-    assert ("kline", "tushare") in deleted_pairs
+    assert ("kline", "tushare") not in deleted_pairs
     assert ("quote", "tencent") not in deleted_pairs
 
     db.close()
