@@ -29,12 +29,14 @@ const AGENT_LABELS: Record<string, string> = {
   daily_report: '收盘复盘',
   premarket_outlook: '盘前分析',
   intraday_monitor: '盘中监测',
+  morning_brief: '早盘简报',
+  tail_brief: '尾盘简报',
   news_digest: '新闻速递',
   chart_analyst: '技术分析',
   tradingagents: 'TradingAgents 深度',
 }
 
-const WORKFLOW_AGENT_KEYS = ['daily_report', 'premarket_outlook', 'intraday_monitor', 'tradingagents']
+const WORKFLOW_AGENT_KEYS = ['daily_report', 'premarket_outlook', 'intraday_monitor', 'morning_brief', 'tail_brief', 'tradingagents']
 const CAPABILITY_AGENT_KEYS = ['news_digest', 'chart_analyst']
 
 export default function HistoryPage() {

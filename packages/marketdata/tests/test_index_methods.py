@@ -42,3 +42,21 @@ def test_index_klines(monkeypatch):
 def test_index_klines_unmapped_returns_empty():
     """美股指数(如 IXIC)未在 INDEX_SECID 映射中 → 空列表,fail-soft。"""
     assert _md().index_klines("IXIC", market="US", days=120) == []
+
+
+def test_index_klines_star50_000688(monkeypatch):
+    """科创50(000688)已映射 1.000688,index_klines 按该 secid 走东财K线。"""
+    from marketdata.client import INDEX_SECID
+
+    assert INDEX_SECID["000688"] == "1.000688"
+
+    captured = {}
+
+    def fake_market_get(url, *, params=None, **kwargs):
+        captured["secid"] = (params or {}).get("secid")
+        return {"data": {"klines": ["2026-07-01,1000,1010,1020,990,1e8,1e11"]}}
+
+    monkeypatch.setattr(kv, "market_get", fake_market_get)
+    out = _md().index_klines("000688", market="CN", days=120)
+    assert captured["secid"] == "1.000688"
+    assert out and out[0].close == 1010.0

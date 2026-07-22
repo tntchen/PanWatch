@@ -31,6 +31,7 @@ interface AlertRule {
   repeat_mode: 'once' | 'repeat'
   expire_at: string | null
   notify_channel_ids: number[]
+  playbook_id: number | null
 }
 
 const DEFAULT_FORM: PriceAlertFormState = {
@@ -44,6 +45,7 @@ const DEFAULT_FORM: PriceAlertFormState = {
   repeat_mode: 'repeat',
   expire_at: '',
   notify_channel_ids: [],
+  playbook_id: null,
 }
 
 function conditionText(item: AlertConditionItem): string {
@@ -53,11 +55,17 @@ function conditionText(item: AlertConditionItem): string {
     turnover: '成交额',
     volume: '成交量',
     volume_ratio: '量比',
+    turnover_rate: '换手率%',
+    capital_flow: '主力净流入(万)',
+    consecutive_close: '收盘价',
   }
+  const prefix = item.type === 'consecutive_close'
+    ? `连续${item.days ?? '?'}日收盘`
+    : (label[item.type] || item.type)
   if (item.op === 'between' && Array.isArray(item.value)) {
-    return `${label[item.type] || item.type} ∈ [${item.value[0]}, ${item.value[1]}]`
+    return `${prefix} ∈ [${item.value[0]}, ${item.value[1]}]`
   }
-  return `${label[item.type] || item.type} ${item.op} ${Array.isArray(item.value) ? item.value.join('~') : item.value}`
+  return `${prefix} ${item.op} ${Array.isArray(item.value) ? item.value.join('~') : item.value}`
 }
 
 export default function StockPriceAlertPanel(props: {
@@ -198,6 +206,7 @@ export default function StockPriceAlertPanel(props: {
       repeat_mode: r.repeat_mode || 'repeat',
       expire_at: r.expire_at ? r.expire_at.slice(0, 16) : '',
       notify_channel_ids: r.notify_channel_ids || [],
+      playbook_id: r.playbook_id ?? null,
     })
     setFormOpen(true)
   }
@@ -325,7 +334,7 @@ export default function StockPriceAlertPanel(props: {
         open={formOpen}
         onOpenChange={setFormOpen}
         title={editingId ? '编辑提醒规则' : '新建提醒规则'}
-        description="支持价格、涨跌幅、成交额、量比条件，支持 AND / OR 组合"
+        description="支持价格、涨跌幅、成交额、量比，A 股另支持换手率/主力净流入/连续N日收盘，可关联方案档案"
         stocks={formStocks}
         channels={channels}
         initial={form}

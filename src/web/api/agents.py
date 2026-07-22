@@ -1085,6 +1085,9 @@ async def scan_intraday(analyze: bool = False, db: Session = Depends(get_db)):
                                     volume_threshold=getattr(
                                         agent, "volume_alert_ratio", 2.0
                                     ),
+                                    # P3c 集成修补：传入现价以启用方案价位穿越检测
+                                    # （playbook_levels=None 时事件门自动按 symbol 读库）
+                                    current_price=item.get("current_price"),
                                 )
                                 data["event_gate"] = {
                                     "reasons": decision.reasons,

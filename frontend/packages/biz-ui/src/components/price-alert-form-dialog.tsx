@@ -1,18 +1,21 @@
 import { useEffect, useMemo, useState } from 'react'
 import { CalendarDays, ChevronLeft, ChevronRight } from 'lucide-react'
+import { fetchAPI } from '@panwatch/api'
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@panwatch/base-ui/components/ui/dialog'
 import { Input } from '@panwatch/base-ui/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@panwatch/base-ui/components/ui/select'
 import { Button } from '@panwatch/base-ui/components/ui/button'
 
 export type RuleOp = 'and' | 'or'
-export type ConditionType = 'price' | 'change_pct' | 'turnover' | 'volume' | 'volume_ratio'
+export type ConditionType = 'price' | 'change_pct' | 'turnover' | 'volume' | 'volume_ratio' | 'turnover_rate' | 'capital_flow' | 'consecutive_close'
 export type ConditionOp = '>=' | '<=' | '>' | '<' | '==' | 'between'
 
 export interface AlertConditionItem {
   type: ConditionType
   op: ConditionOp
   value: number | [number, number]
+  /** 仅 consecutive_close 使用：连续 N 日（1-10） */
+  days?: number
 }
 
 export interface PriceAlertFormState {
@@ -26,6 +29,7 @@ export interface PriceAlertFormState {
   repeat_mode: 'once' | 'repeat'
   expire_at: string
   notify_channel_ids: number[]
+  playbook_id: number | null
 }
 
 export interface PriceAlertSubmitPayload {
@@ -41,6 +45,7 @@ export interface PriceAlertSubmitPayload {
   repeat_mode: 'once' | 'repeat'
   expire_at: string | null
   notify_channel_ids: number[]
+  playbook_id: number | null
 }
 
 interface StockOption {
@@ -64,6 +69,20 @@ const TYPE_LABEL: Record<ConditionType, string> = {
   turnover: '成交额',
   volume: '成交量',
   volume_ratio: '量比',
+  turnover_rate: '换手率(%)',
+  capital_flow: '主力净流入(万元)',
+  consecutive_close: '连续N日收盘',
+}
+
+/** 仅 A 股（CN）支持的新条件类型 —— 与后端引擎 CN-only 门控一致 */
+const CN_ONLY_TYPES: ReadonlySet<ConditionType> = new Set(['turnover_rate', 'capital_flow', 'consecutive_close'])
+
+interface PlaybookOption {
+  id: number
+  version: number
+  is_active: boolean
+  summary?: string | null
+  note?: string | null
 }
 
 const buildDefaultForm = (stockId = 0): PriceAlertFormState => ({
@@ -77,6 +96,7 @@ const buildDefaultForm = (stockId = 0): PriceAlertFormState => ({
   repeat_mode: 'repeat',
   expire_at: '',
   notify_channel_ids: [],
+  playbook_id: null,
 })
 
 export default function PriceAlertFormDialog(props: {
@@ -93,6 +113,15 @@ export default function PriceAlertFormDialog(props: {
 }) {
   const stockOptions = useMemo(() => props.stocks, [props.stocks])
   const [form, setForm] = useState<PriceAlertFormState>(buildDefaultForm())
+  const [formError, setFormError] = useState('')
+  const [playbooks, setPlaybooks] = useState<PlaybookOption[]>([])
+
+  const selectedStock = useMemo(
+    () => stockOptions.find(s => s.id === form.stock_id) || null,
+    [stockOptions, form.stock_id]
+  )
+  const selectedMarket = String(selectedStock?.market || '').trim().toUpperCase()
+  const isCnStock = selectedMarket === 'CN'
 
   useEffect(() => {
     if (!props.open) return
@@ -105,10 +134,32 @@ export default function PriceAlertFormDialog(props: {
       stock_id: hasPreferred ? preferredStockId : (props.initial?.stock_id || fallbackStockId),
       items: props.initial?.items?.length ? props.initial.items : [{ type: 'price', op: '>=', value: 0 }],
       notify_channel_ids: props.initial?.notify_channel_ids || [],
+      playbook_id: props.initial?.playbook_id ?? null,
     }
     setForm(merged)
+    setFormError('')
     setCalendarOpen(false)
   }, [props.open, props.initial, stockOptions])
+
+  // 关联方案下拉数据源（契约 B：GET /api/stocks/{id}/playbooks）；接口未就绪或失败时静默降级为空
+  useEffect(() => {
+    if (!props.open) return
+    const stockId = Number(form.stock_id || 0)
+    if (!stockId) {
+      setPlaybooks([])
+      return
+    }
+    let cancelled = false
+    fetchAPI<PlaybookOption[]>(`/stocks/${stockId}/playbooks`)
+      .then(data => {
+        if (cancelled) return
+        setPlaybooks(Array.isArray(data) ? data : [])
+      })
+      .catch(() => {
+        if (!cancelled) setPlaybooks([])
+      })
+    return () => { cancelled = true }
+  }, [props.open, form.stock_id])
 
   const updateCond = (idx: number, patch: Partial<AlertConditionItem>) => {
     setForm(prev => {
@@ -132,6 +183,26 @@ export default function PriceAlertFormDialog(props: {
   const submit = async () => {
     if (!form.stock_id) return
     if (!form.items.length) return
+    // CN-only 门控：股票市场可判定时，非 CN 不允许提交新类型条件
+    const cnOnlyItems = form.items.filter(it => CN_ONLY_TYPES.has(it.type))
+    if (cnOnlyItems.length > 0 && selectedMarket && !isCnStock) {
+      setFormError('换手率/主力净流入/连续N日收盘 仅支持 A 股（CN）股票')
+      return
+    }
+    if (cnOnlyItems.length > 0 && !selectedMarket) {
+      setFormError('无法确认股票市场，换手率/主力净流入/连续N日收盘 仅限 A 股，请重新选择股票')
+      return
+    }
+    for (const it of form.items) {
+      if (it.type === 'consecutive_close') {
+        const days = Number(it.days || 0)
+        if (!Number.isInteger(days) || days < 1 || days > 10) {
+          setFormError('连续N日收盘 需要填写天数 N（1-10 的整数）')
+          return
+        }
+      }
+    }
+    setFormError('')
     await props.onSubmit({
       stock_id: form.stock_id,
       name: form.name.trim(),
@@ -142,6 +213,7 @@ export default function PriceAlertFormDialog(props: {
       repeat_mode: form.repeat_mode,
       expire_at: form.expire_at ? new Date(form.expire_at).toISOString() : null,
       notify_channel_ids: form.notify_channel_ids || [],
+      playbook_id: form.playbook_id ?? null,
     })
   }
 
@@ -220,7 +292,7 @@ export default function PriceAlertFormDialog(props: {
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
             <div>
               <div className="text-[12px] text-muted-foreground mb-1">股票</div>
-              <Select value={String(form.stock_id || '')} onValueChange={(v) => setForm(prev => ({ ...prev, stock_id: Number(v) }))}>
+              <Select value={String(form.stock_id || '')} onValueChange={(v) => setForm(prev => ({ ...prev, stock_id: Number(v), playbook_id: null }))}>
                 <SelectTrigger><SelectValue placeholder="选择股票" /></SelectTrigger>
                 <SelectContent>
                   {stockOptions.map(s => (
@@ -232,6 +304,27 @@ export default function PriceAlertFormDialog(props: {
             <div>
               <div className="text-[12px] text-muted-foreground mb-1">规则名称</div>
               <Input value={form.name} onChange={e => setForm(prev => ({ ...prev, name: e.target.value }))} placeholder="例如：突破120提醒" />
+            </div>
+          </div>
+
+          <div>
+            <div className="text-[12px] text-muted-foreground mb-1">关联方案（可选）</div>
+            <Select
+              value={form.playbook_id ? String(form.playbook_id) : 'none'}
+              onValueChange={(v) => setForm(prev => ({ ...prev, playbook_id: v === 'none' ? null : Number(v) }))}
+            >
+              <SelectTrigger><SelectValue placeholder="不关联" /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="none">不关联</SelectItem>
+                {playbooks.map(p => (
+                  <SelectItem key={p.id} value={String(p.id)}>
+                    v{p.version}{p.is_active ? '（当前）' : ''}{p.note ? ` · ${p.note}` : ''}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <div className="mt-1 text-[10px] text-muted-foreground/70">
+              {playbooks.length > 0 ? '命中时通知将附带方案提示文案' : '该股票暂无方案档案，命中通知不附加方案提示'}
             </div>
           </div>
 
@@ -398,19 +491,32 @@ export default function PriceAlertFormDialog(props: {
               <div className="text-[12px] text-muted-foreground">条件列表</div>
               <Button variant="secondary" size="sm" className="h-7 text-[11px]" onClick={addCond}>添加条件</Button>
             </div>
-            {form.items.map((it, idx) => (
+            {form.items.map((it, idx) => {
+              const isConsecutive = it.type === 'consecutive_close'
+              const availableTypes = Object.entries(TYPE_LABEL).filter(([k]) =>
+                isCnStock || !CN_ONLY_TYPES.has(k as ConditionType)
+              )
+              return (
               <div key={idx} className="grid grid-cols-12 gap-2">
-                <div className="col-span-4">
-                  <Select value={it.type} onValueChange={(v) => updateCond(idx, { type: v as ConditionType })}>
+                <div className={isConsecutive ? 'col-span-3' : 'col-span-4'}>
+                  <Select
+                    value={it.type}
+                    onValueChange={(v) => {
+                      const nextType = v as ConditionType
+                      updateCond(idx, nextType === 'consecutive_close'
+                        ? { type: nextType, days: it.days && it.days >= 1 ? it.days : 2 }
+                        : { type: nextType, days: undefined })
+                    }}
+                  >
                     <SelectTrigger className="h-8"><SelectValue /></SelectTrigger>
                     <SelectContent>
-                      {Object.entries(TYPE_LABEL).map(([k, label]) => (
+                      {availableTypes.map(([k, label]) => (
                         <SelectItem key={k} value={k}>{label}</SelectItem>
                       ))}
                     </SelectContent>
                   </Select>
                 </div>
-                <div className="col-span-3">
+                <div className={isConsecutive ? 'col-span-2' : 'col-span-3'}>
                   <Select value={it.op} onValueChange={(v) => updateCond(idx, { op: v as ConditionOp })}>
                     <SelectTrigger className="h-8"><SelectValue /></SelectTrigger>
                     <SelectContent>
@@ -423,7 +529,7 @@ export default function PriceAlertFormDialog(props: {
                     </SelectContent>
                   </Select>
                 </div>
-                <div className="col-span-4">
+                <div className={isConsecutive ? 'col-span-3' : 'col-span-4'}>
                   {it.op === 'between' ? (
                     <div className="grid grid-cols-2 gap-1">
                       <Input
@@ -456,14 +562,34 @@ export default function PriceAlertFormDialog(props: {
                     />
                   )}
                 </div>
+                {isConsecutive && (
+                  <div className="col-span-3">
+                    <Input
+                      className="h-8"
+                      type="number"
+                      min={1}
+                      max={10}
+                      step={1}
+                      placeholder="天数N"
+                      title="连续天数 N（1-10）"
+                      value={it.days == null ? '' : String(it.days)}
+                      onChange={(e) => updateCond(idx, { days: e.target.value === '' ? undefined : Number(e.target.value) })}
+                    />
+                  </div>
+                )}
                 <div className="col-span-1">
                   <Button variant="ghost" size="sm" className="h-8 w-8 p-0" onClick={() => removeCond(idx)}>×</Button>
                 </div>
               </div>
-            ))}
+              )
+            })}
           </div>
 
           <div className="flex items-center justify-end gap-2">
+            {formError && <div className="mr-auto text-[12px] text-rose-500">{formError}</div>}
+            {!formError && !isCnStock && selectedMarket && (
+              <div className="mr-auto text-[11px] text-muted-foreground/70">非 A 股股票：换手率/主力净流入/连续N日收盘 不可用</div>
+            )}
             <Button variant="ghost" onClick={() => props.onOpenChange(false)}>取消</Button>
             <Button onClick={submit} disabled={props.submitting}>
               {props.submitting ? '保存中...' : (props.submitLabel || '保存规则')}

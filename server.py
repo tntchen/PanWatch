@@ -4,6 +4,7 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
+from datetime import date, datetime
 
 import uvicorn
 
@@ -40,6 +41,8 @@ from src.agents.news_digest import NewsDigestAgent
 from src.agents.chart_analyst import ChartAnalystAgent
 from src.agents.intraday_monitor import IntradayMonitorAgent
 from src.agents.premarket_outlook import PremarketOutlookAgent
+from src.agents.morning_brief import MorningBriefAgent
+from src.agents.tail_brief import TailBriefAgent
 from src.agents.tradingagents import TradingAgentsAgent
 
 logger = logging.getLogger(__name__)
@@ -771,6 +774,95 @@ def load_watchlist_for_agent(agent_name: str) -> list[StockConfig]:
         db.close()
 
 
+# --- P3a v1.5 流水注入 ------------------------------------------------------
+
+# trades_text 字符预算:CJK 1 字 ≈ 1 token,200 字符即 ≤200 token/股 的保守上界。
+TRADES_TEXT_CHAR_BUDGET = 200
+
+_TRADE_DIRECTION_LABELS = {"buy": "买", "sell": "卖", "adjustment": "调整"}
+
+
+def _fmt_trade_num(value) -> str:
+    """95.0 -> '95';112.572 -> '112.572';不可解析时原样字符串化。"""
+    try:
+        f = float(value)
+        return str(int(f)) if f == int(f) else f"{f:g}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _load_position_recent_trades(db, position_id: int, limit: int = 10) -> list[dict]:
+    """某持仓的近期流水:当日全部 + 近 limit 笔(时间升序)。
+
+    字段:date(YYYY-MM-DD)/direction/price/quantity/fee/realized_pnl/note。
+    """
+    from src.web.models import PositionTrade
+
+    rows = (
+        db.query(PositionTrade)
+        .filter(PositionTrade.position_id == position_id)
+        .order_by(PositionTrade.traded_at.desc(), PositionTrade.id.desc())
+        .all()
+    )
+    today = date.today()
+    todays: list = []
+    older: list = []
+    for r in rows:
+        traded_date = r.traded_at.date() if r.traded_at else None
+        if traded_date == today:
+            todays.append(r)
+        elif len(todays) + len(older) < limit:
+            older.append(r)
+    picked = todays + older
+    picked.sort(key=lambda r: (r.traded_at or datetime.min, r.id or 0))
+    return [
+        {
+            "date": r.traded_at.strftime("%Y-%m-%d") if r.traded_at else "",
+            "direction": r.direction,
+            "price": r.price,
+            "quantity": r.quantity,
+            "fee": r.fee,
+            "realized_pnl": r.realized_pnl,
+            "note": r.note or "",
+        }
+        for r in picked
+    ]
+
+
+def format_trades_text(trades: list[dict]) -> str:
+    """流水紧凑文本,形如 '7/17 买1000@95; 7/21 卖500@130(盈8704)'。
+
+    ≤200 字符(≈200 token 上界);超预算时从最老的一笔开始舍弃;无流水返回空串。
+    """
+    if not trades:
+        return ""
+    segments: list[str] = []
+    for t in trades:
+        raw_date = str(t.get("date") or "")
+        try:
+            dt = date.fromisoformat(raw_date[:10])
+            md = f"{dt.month}/{dt.day}"
+        except ValueError:
+            md = raw_date
+        label = _TRADE_DIRECTION_LABELS.get(str(t.get("direction") or ""), "交易")
+        seg = f"{md} {label}{t.get('quantity')}@{_fmt_trade_num(t.get('price'))}"
+        pnl = t.get("realized_pnl")
+        if pnl is not None:
+            try:
+                pnl_f = float(pnl)
+                tag = "盈" if pnl_f >= 0 else "亏"
+                seg += f"({tag}{_fmt_trade_num(abs(pnl_f))})"
+            except (TypeError, ValueError):
+                pass
+        note = str(t.get("note") or "").strip()
+        if t.get("direction") == "adjustment" and note:
+            seg += f"({note[:16]})"
+        segments.append(seg)
+    while len(segments) > 1 and len("; ".join(segments)) > TRADES_TEXT_CHAR_BUDGET:
+        segments.pop(0)  # 舍弃最老的一笔,保留近期操作
+    return "; ".join(segments)[:TRADES_TEXT_CHAR_BUDGET]
+
+
 def load_portfolio_for_agent(agent_name: str) -> PortfolioInfo:
     """从数据库加载某个 Agent 关联股票的持仓信息（包括多账户）"""
     from src.web.models import Account, Position
@@ -810,6 +902,13 @@ def load_portfolio_for_agent(agent_name: str) -> PortfolioInfo:
                 except ValueError:
                     market = MarketCode.CN
 
+                # P3a v1.5:附带近期流水(当日全部 + 近 10 笔);失败容错为空,不影响主流程
+                try:
+                    trades = _load_position_recent_trades(db, pos.id)
+                except Exception as e:
+                    logger.warning(f"加载持仓流水失败 position_id={pos.id}: {e}")
+                    trades = []
+
                 position_infos.append(
                     PositionInfo(
                         account_id=acc.id,
@@ -822,6 +921,8 @@ def load_portfolio_for_agent(agent_name: str) -> PortfolioInfo:
                         quantity=pos.quantity,
                         invested_amount=pos.invested_amount,
                         trading_style=pos.trading_style or "swing",
+                        trades=trades,
+                        trades_text=format_trades_text(trades),
                     )
                 )
 
@@ -1110,6 +1211,8 @@ AGENT_REGISTRY: dict[str, type] = {
     "news_digest": NewsDigestAgent,
     "chart_analyst": ChartAnalystAgent,
     "intraday_monitor": IntradayMonitorAgent,
+    "morning_brief": MorningBriefAgent,
+    "tail_brief": TailBriefAgent,
     "tradingagents": TradingAgentsAgent,
 }
 

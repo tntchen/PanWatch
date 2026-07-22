@@ -1585,6 +1585,16 @@ def _m118_paper_trading_market_allocations(conn: Connection) -> None:
         )
 
 
+def _m119_price_alert_rule_playbook_id(conn: Connection) -> None:
+    """price_alert_rules 新增 playbook_id（关联个股方案档案，可空）。"""
+    _add_column_if_missing(
+        conn,
+        "price_alert_rules",
+        "playbook_id",
+        "ALTER TABLE price_alert_rules ADD COLUMN playbook_id INTEGER",
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(101, "agent_config_kind_and_visibility", _m101_agent_config_kind),
     Migration(102, "backfill_agent_kind_data", _m102_backfill_agent_kind),
@@ -1604,6 +1614,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(116, "chat_tables", _m116_chat_tables),
     Migration(117, "chat_initial_context", _m117_chat_initial_context),
     Migration(118, "paper_trading_market_allocations", _m118_paper_trading_market_allocations),
+    Migration(119, "price_alert_rule_playbook_id", _m119_price_alert_rule_playbook_id),
 )
 
 

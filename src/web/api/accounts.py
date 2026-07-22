@@ -5,13 +5,20 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func
 from sqlalchemy.orm import Session
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from datetime import datetime, timedelta, timezone
+from typing import Literal
 
 from src.web.database import get_db
-from src.web.models import Account, PriceAlertRule, Position, Stock
+from src.web.models import Account, PositionTrade, PriceAlertRule, Position, Stock
 from src.core.marketdata_client import md_quote_rows
+from src.core.position_trading import (
+    InsufficientPositionError,
+    apply_buy,
+    apply_sell,
+    build_adjustment_note,
+)
 from src.collectors.market_http import TTLCache
 from src.models.market import MarketCode
 
@@ -140,6 +147,9 @@ class PositionResponse(BaseModel):
     invested_amount: float | None
     sort_order: int
     trading_style: str | None
+    # 持仓交易化 Phase 1：由 position_trades 流水聚合（新表 create_all，不加列免迁移）
+    realized_pnl_total: float = 0
+    trade_count: int = 0
     # 关联信息
     account_name: str | None = None
     stock_symbol: str | None = None
@@ -149,6 +159,15 @@ class PositionResponse(BaseModel):
         from_attributes = True
 
 
+class TradeCreate(BaseModel):
+    direction: Literal["buy", "sell"]  # adjustment 由系统自动生成，不接受手工录入
+    price: float = Field(gt=0)
+    quantity: int = Field(gt=0)
+    fee: float = Field(default=0, ge=0)
+    traded_at: datetime | None = None  # 默认当前时间
+    note: str | None = None
+
+
 class PositionReorderItem(BaseModel):
     id: int
     sort_order: int
@@ -156,6 +175,63 @@ class PositionReorderItem(BaseModel):
 
 class PositionReorderRequest(BaseModel):
     items: list[PositionReorderItem]
+
+
+# ========== 持仓流水序列化辅助 ==========
+
+def _trade_stats(db: Session, position_ids: list[int]) -> dict[int, tuple[int, float]]:
+    """按持仓聚合流水统计：{position_id: (trade_count, realized_pnl_total)}。
+
+    realized_pnl_total 用 SUM(realized_pnl) 从流水聚合（NULL 的 buy/adjustment 自动忽略），
+    避免给 positions 表加列（新表 create_all 即可覆盖，老库免迁移）。
+    """
+    if not position_ids:
+        return {}
+    rows = (
+        db.query(
+            PositionTrade.position_id,
+            func.count(PositionTrade.id),
+            func.coalesce(func.sum(PositionTrade.realized_pnl), 0.0),
+        )
+        .filter(PositionTrade.position_id.in_(position_ids))
+        .group_by(PositionTrade.position_id)
+        .all()
+    )
+    return {pid: (int(cnt), float(total)) for pid, cnt, total in rows}
+
+
+def _position_dict(pos: Position, stats: dict[int, tuple[int, float]] | None = None) -> dict:
+    trade_count, realized_total = (stats or {}).get(pos.id, (0, 0.0))
+    return {
+        "id": pos.id,
+        "account_id": pos.account_id,
+        "stock_id": pos.stock_id,
+        "cost_price": pos.cost_price,
+        "quantity": pos.quantity,
+        "invested_amount": pos.invested_amount,
+        "sort_order": pos.sort_order or 0,
+        "trading_style": pos.trading_style,
+        "realized_pnl_total": realized_total,
+        "trade_count": trade_count,
+        "account_name": pos.account.name if pos.account else None,
+        "stock_symbol": pos.stock.symbol if pos.stock else None,
+        "stock_name": pos.stock.name if pos.stock else None,
+    }
+
+
+def _trade_dict(trade: PositionTrade) -> dict:
+    return {
+        "id": trade.id,
+        "position_id": trade.position_id,
+        "direction": trade.direction,
+        "price": trade.price,
+        "quantity": trade.quantity,
+        "fee": trade.fee,
+        "traded_at": trade.traded_at.isoformat() if trade.traded_at else None,
+        "realized_pnl": trade.realized_pnl,
+        "note": trade.note,
+        "created_at": trade.created_at.isoformat() if trade.created_at else None,
+    }
 
 
 # ========== Account Endpoints ==========
@@ -235,22 +311,8 @@ def list_positions(
         query = query.filter(Position.stock_id == stock_id)
 
     positions = query.order_by(Position.account_id.asc(), Position.sort_order.asc(), Position.id.asc()).all()
-    result = []
-    for pos in positions:
-        result.append({
-            "id": pos.id,
-            "account_id": pos.account_id,
-            "stock_id": pos.stock_id,
-            "cost_price": pos.cost_price,
-            "quantity": pos.quantity,
-            "invested_amount": pos.invested_amount,
-            "sort_order": pos.sort_order or 0,
-            "trading_style": pos.trading_style,
-            "account_name": pos.account.name if pos.account else None,
-            "stock_symbol": pos.stock.symbol if pos.stock else None,
-            "stock_name": pos.stock.name if pos.stock else None,
-        })
-    return result
+    stats = _trade_stats(db, [p.id for p in positions])
+    return [_position_dict(pos, stats) for pos in positions]
 
 
 @router.post("/positions", response_model=PositionResponse)
@@ -291,27 +353,22 @@ def create_position(data: PositionCreate, db: Session = Depends(get_db)):
     db.refresh(position)
 
     logger.info(f"创建持仓: {account.name} - {stock.name}")
-    return {
-        "id": position.id,
-        "account_id": position.account_id,
-        "stock_id": position.stock_id,
-        "cost_price": position.cost_price,
-        "quantity": position.quantity,
-        "invested_amount": position.invested_amount,
-        "sort_order": position.sort_order or 0,
-        "trading_style": position.trading_style,
-        "account_name": account.name,
-        "stock_symbol": stock.symbol,
-        "stock_name": stock.name,
-    }
+    return _position_dict(position)
 
 
 @router.put("/positions/{position_id}", response_model=PositionResponse)
 def update_position(position_id: int, data: PositionUpdate, db: Session = Depends(get_db)):
-    """更新持仓"""
+    """更新持仓
+
+    契约（Phase 1）：cost_price 或 quantity 实际发生变化时，自动生成一条
+    direction="adjustment" 流水（note 记录 old→new，realized_pnl=null），不联动资金。
+    """
     position = db.query(Position).filter(Position.id == position_id).first()
     if not position:
         raise HTTPException(404, "持仓不存在")
+
+    old_cost = position.cost_price
+    old_qty = position.quantity
 
     if data.cost_price is not None:
         position.cost_price = data.cost_price
@@ -323,36 +380,137 @@ def update_position(position_id: int, data: PositionUpdate, db: Session = Depend
         # 空字符串表示清空，设为 None
         position.trading_style = data.trading_style if data.trading_style else None
 
+    cost_changed = data.cost_price is not None and data.cost_price != old_cost
+    qty_changed = data.quantity is not None and data.quantity != old_qty
+    if cost_changed or qty_changed:
+        db.add(PositionTrade(
+            position_id=position.id,
+            direction="adjustment",
+            price=position.cost_price,
+            quantity=position.quantity,
+            fee=0,
+            traded_at=datetime.now(),
+            realized_pnl=None,
+            note=build_adjustment_note(old_cost, old_qty, position.cost_price, position.quantity),
+        ))
+        logger.info(
+            f"持仓手动调整生成 adjustment 流水: position={position.id} "
+            f"成本 {old_cost}→{position.cost_price} 数量 {old_qty}→{position.quantity}"
+        )
+
     db.commit()
     db.refresh(position)
 
     logger.info(f"更新持仓: {position.account.name} - {position.stock.name}")
-    return {
-        "id": position.id,
-        "account_id": position.account_id,
-        "stock_id": position.stock_id,
-        "cost_price": position.cost_price,
-        "quantity": position.quantity,
-        "invested_amount": position.invested_amount,
-        "sort_order": position.sort_order or 0,
-        "trading_style": position.trading_style,
-        "account_name": position.account.name,
-        "stock_symbol": position.stock.symbol,
-        "stock_name": position.stock.name,
-    }
+    stats = _trade_stats(db, [position.id])
+    return _position_dict(position, stats)
 
 
 @router.delete("/positions/{position_id}")
 def delete_position(position_id: int, db: Session = Depends(get_db)):
-    """删除持仓"""
+    """删除持仓（存在交易流水时禁止删除，返回 400）"""
     position = db.query(Position).filter(Position.id == position_id).first()
     if not position:
         raise HTTPException(404, "持仓不存在")
 
+    trade_count = (
+        db.query(func.count(PositionTrade.id))
+        .filter(PositionTrade.position_id == position.id)
+        .scalar()
+    ) or 0
+    if trade_count > 0:
+        raise HTTPException(
+            400,
+            f"持仓存在交易流水（{trade_count} 条），禁止删除；"
+            f"如需清仓请通过减仓流水将数量归零（关仓保留行）",
+        )
+
+    # 删除提交后实例 detached，先取名称再删，避免日志触发 DetachedInstanceError
+    acc_name = position.account.name if position.account else ""
+    stock_name = position.stock.name if position.stock else ""
     db.delete(position)
     db.commit()
-    logger.info(f"删除持仓: {position.account.name} - {position.stock.name}")
+    logger.info(f"删除持仓: {acc_name} - {stock_name}")
     return {"success": True}
+
+
+# ========== Position Trade Endpoints（持仓交易化 Phase 1） ==========
+
+@router.post("/positions/{position_id}/trades")
+def create_position_trade(position_id: int, data: TradeCreate, db: Session = Depends(get_db)):
+    """录入一笔买入/卖出流水。
+
+    单事务提交：流水插入 + 成本重算 + Account 资金联动 同事务；
+    任一步失败整体回滚，三处状态保持不变。
+    """
+    position = db.query(Position).filter(Position.id == position_id).first()
+    if not position:
+        raise HTTPException(404, "持仓不存在")
+    account = db.query(Account).filter(Account.id == position.account_id).first()
+    if not account:
+        raise HTTPException(404, "账户不存在")
+
+    try:
+        if data.direction == "buy":
+            comp = apply_buy(
+                position.cost_price, position.quantity, position.invested_amount,
+                account.available_funds, data.price, data.quantity, data.fee,
+            )
+        else:  # sell
+            comp = apply_sell(
+                position.cost_price, position.quantity, position.invested_amount,
+                account.available_funds, data.price, data.quantity, data.fee,
+            )
+    except InsufficientPositionError as e:
+        raise HTTPException(400, str(e))
+
+    trade = PositionTrade(
+        position_id=position.id,
+        direction=data.direction,
+        price=float(data.price),
+        quantity=int(data.quantity),
+        fee=float(data.fee),
+        traded_at=data.traded_at or datetime.now(),
+        realized_pnl=float(comp.realized_pnl) if comp.realized_pnl is not None else None,
+        note=data.note,
+    )
+    position.cost_price = float(comp.new_cost_price)
+    position.quantity = int(comp.new_quantity)
+    position.invested_amount = float(comp.new_invested_amount)
+    account.available_funds = float(comp.new_available_funds)
+
+    db.add(trade)
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception(f"交易流水提交失败已回滚: position={position_id}")
+        raise HTTPException(500, "交易流水提交失败，已回滚，持仓与资金未变更")
+
+    db.refresh(trade)
+    db.refresh(position)
+    logger.info(
+        f"录入流水: position={position.id} {data.direction} "
+        f"{data.quantity}@{data.price} fee={data.fee}"
+    )
+    stats = _trade_stats(db, [position.id])
+    return {"position": _position_dict(position, stats), "trade": _trade_dict(trade)}
+
+
+@router.get("/positions/{position_id}/trades")
+def list_position_trades(position_id: int, db: Session = Depends(get_db)):
+    """获取持仓交易流水，按 traded_at 升序。"""
+    position = db.query(Position).filter(Position.id == position_id).first()
+    if not position:
+        raise HTTPException(404, "持仓不存在")
+
+    trades = (
+        db.query(PositionTrade)
+        .filter(PositionTrade.position_id == position.id)
+        .order_by(PositionTrade.traded_at.asc(), PositionTrade.id.asc())
+        .all()
+    )
+    return [_trade_dict(t) for t in trades]
 
 
 @router.put("/positions/reorder/batch")
@@ -408,6 +566,7 @@ def get_portfolio_summary(
                 "total_pnl_pct": 0,
                 "available_funds": 0,
                 "total_assets": 0,
+                "realized_pnl": 0,
             }
         }
 
@@ -433,12 +592,18 @@ def get_portfolio_summary(
     grand_total_cost = 0
     grand_available_funds = 0
     grand_daily_pnl = 0
+    grand_realized_pnl = 0.0
+
+    # 持仓流水聚合（realized_pnl_total / trade_count），一次查询避免 N+1
+    all_position_ids = [pos.id for acc in accounts for pos in (acc.positions or [])]
+    trade_stats = _trade_stats(db, all_position_ids)
 
     for acc in accounts:
         positions_data = []
         acc_market_value = 0
         acc_cost = 0
         acc_daily_pnl = 0
+        acc_realized_pnl = 0.0
 
         positions_sorted = sorted(
             list(acc.positions or []),
@@ -487,6 +652,9 @@ def get_portfolio_summary(
 
                 acc_market_value += market_value_cny
 
+            pos_trade_count, pos_realized_total = trade_stats.get(pos.id, (0, 0.0))
+            acc_realized_pnl += pos_realized_total
+
             positions_data.append({
                 "id": pos.id,
                 "stock_id": pos.stock_id,
@@ -498,6 +666,8 @@ def get_portfolio_summary(
                 "invested_amount": pos.invested_amount,
                 "sort_order": pos.sort_order or 0,
                 "trading_style": pos.trading_style,
+                "realized_pnl_total": round(pos_realized_total, 2),
+                "trade_count": pos_trade_count,
                 "current_price": current_price,
                 "current_price_cny": round(current_price * rate, 2) if current_price else None,
                 "change_pct": change_pct,
@@ -529,6 +699,7 @@ def get_portfolio_summary(
             "total_pnl_pct": round(acc_pnl_pct, 2),
             "total_daily_pnl": round(acc_daily_pnl, 2),
             "total_assets": round(acc_total_assets, 2),
+            "realized_pnl": round(acc_realized_pnl, 2),
             "positions": positions_data,
         })
 
@@ -536,6 +707,7 @@ def get_portfolio_summary(
         grand_total_cost += acc_cost
         grand_available_funds += acc.available_funds
         grand_daily_pnl += acc_daily_pnl
+        grand_realized_pnl += acc_realized_pnl
 
     if include_quotes:
         grand_pnl = grand_total_market_value - grand_total_cost
@@ -565,6 +737,7 @@ def get_portfolio_summary(
             "total_daily_pnl": round(grand_daily_pnl, 2),
             "available_funds": round(grand_available_funds, 2),
             "total_assets": round(grand_total_assets, 2),
+            "realized_pnl": round(grand_realized_pnl, 2),
         },
         "exchange_rates": {
             "HKD_CNY": hkd_rate,

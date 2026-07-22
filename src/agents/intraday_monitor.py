@@ -52,6 +52,23 @@ SUGGESTION_TYPES = {
 
 PROMPT_PATH = Path(__file__).parent.parent.parent / "prompts" / "intraday_monitor.txt"
 
+# 方案档案规则段标记（P3c）：prompt 模板中以 HTML 注释包裹的方案规则段，
+# 仅对有 playbook 的股票保留（去掉标记），无 playbook 股票整段剔除，
+# 保证无档案股票的 system prompt 与改造前逐字一致。
+_PLAYBOOK_BLOCK_PATTERN = re.compile(
+    r"\n*<!-- PLAYBOOK_SECTION_START -->.*?<!-- PLAYBOOK_SECTION_END -->\n?",
+    re.DOTALL,
+)
+
+
+def _apply_playbook_prompt_section(system_prompt: str, has_playbook: bool) -> str:
+    """按是否有方案档案处理 prompt 模板中的方案规则段。"""
+    if has_playbook:
+        return system_prompt.replace(
+            "<!-- PLAYBOOK_SECTION_START -->\n", ""
+        ).replace("\n<!-- PLAYBOOK_SECTION_END -->", "")
+    return _PLAYBOOK_BLOCK_PATTERN.sub("", system_prompt)
+
 
 class IntradayMonitorAgent(BaseAgent):
     """
@@ -180,6 +197,11 @@ class IntradayMonitorAgent(BaseAgent):
     def build_prompt(self, data: dict, context: AgentContext) -> tuple[str, str]:
         """构建盘中分析 Prompt"""
         system_prompt = PROMPT_PATH.read_text(encoding="utf-8")
+        # 方案档案摘要（P3a 注入到 symbol_context；无档案为 None）
+        playbook_summary = (data.get("symbol_context") or {}).get("playbook")
+        system_prompt = _apply_playbook_prompt_section(
+            system_prompt, bool(playbook_summary)
+        )
 
         # 辅助函数：安全获取数值，None 转为默认值
         def safe_num(value, default=0):
@@ -273,6 +295,13 @@ class IntradayMonitorAgent(BaseAgent):
             lines.append(
                 f"- 上下文质量：{quality.get('score', 0)}（实时新闻 {quality.get('realtime_news_count', 0)} 条，扩展新闻 {quality.get('extended_news_count', 0)} 条，历史新闻 {quality.get('history_news_count', 0)} 条）"
             )
+
+        # 方案档案摘要（P3c）：仅有 playbook 的股票注入；无档案股票不产出本节，
+        # 保证其 prompt 与改造前完全一致。
+        if playbook_summary:
+            lines.append("\n## 方案档案（操作纪律）")
+            lines.append(str(playbook_summary).strip())
+            lines.append("- 请结合方案价位与纪律解读上述行情与事件。")
 
         layered_news = symbol_ctx.get("news") or {}
         realtime_news = layered_news.get("realtime") or []
@@ -1015,6 +1044,7 @@ class IntradayMonitorAgent(BaseAgent):
                         kline_summary=kline_summary,
                         price_threshold=self.price_alert_threshold,
                         volume_threshold=self.volume_alert_ratio,
+                        current_price=getattr(stock, "current_price", None),
                     )
                     data["event_gate"] = {
                         "reasons": decision.reasons,

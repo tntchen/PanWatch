@@ -131,7 +131,13 @@ _REPORT_MARGIN = "RPTA_WEB_RZRQ_GGMX"
 
 
 class EastmoneyMarginVendor(MarginVendor):
-    """融资融券:按 symbol 逐只请求近期明细,取最新一条(sortTypes=-1 已降序 → data[0])。"""
+    """融资融券:按 symbol 逐只请求近期明细。
+
+    默认(快照语义)取最新一条(sortTypes=-1 已降序 → data[0]);
+    config["series"]=True 时返回每只股票的全部已抓明细(默认 30 行,
+    config["days"] 可调),供周度趋势类消费方使用——两种模式返回类型一致
+    (list[MarginItem]),调用方按模式解读。
+    """
 
     name = "eastmoney"
     supports_markets = {"CN"}
@@ -139,31 +145,51 @@ class EastmoneyMarginVendor(MarginVendor):
     def fetch(self, symbols: list[Symbol], config: dict) -> list[MarginItem]:
         if not symbols:
             return []
+        series = bool((config or {}).get("series"))
+        if series:
+            try:
+                days = int((config or {}).get("days") or 30)
+            except Exception:
+                days = 30
+            page_size = min(max(days, 1), 200)
+        else:
+            page_size = 30  # 快照路径保持既有请求形态不变
         out: list[MarginItem] = []
         for sym in symbols:
             try:
                 filter_str = f'(SCODE="{sym.code}")'
-                rows = _datacenter_get(_REPORT_MARGIN, filter_str, "DATE", page_size=30)
+                rows = _datacenter_get(_REPORT_MARGIN, filter_str, "DATE", page_size=page_size)
                 if not rows:
                     continue
-                row = rows[0]
-                out.append(
-                    MarginItem(
-                        date=str(row.get("DATE") or "")[:10],
-                        symbol=sym.code,
-                        rz_balance=_to_float(row.get("RZYE")),
-                        rz_buy=_to_float(row.get("RZMRE")),
-                        rz_repay=_to_float(row.get("RZCHE")),
-                        rq_balance=_to_float(row.get("RQYE")),
-                        rq_sell_vol=_to_float(row.get("RQMCL")),
-                        rq_repay_vol=_to_float(row.get("RQCHL")),
-                        total_balance=_to_float(row.get("RZRQYE")),
-                    )
-                )
+                for row in (rows if series else rows[:1]):
+                    item = _parse_margin_row(sym.code, row)
+                    if item is not None:
+                        out.append(item)
             except Exception as e:
                 logger.debug(f"东财融资融券取数异常 symbol={sym.code}: {e}")
                 continue
         return out
+
+
+def _parse_margin_row(symbol_code: str, row: dict) -> MarginItem | None:
+    """解析一行融资融券明细;行损坏返回 None(不抛,由调用方跳过)。"""
+    if not isinstance(row, dict):
+        return None
+    try:
+        return MarginItem(
+            date=str(row.get("DATE") or "")[:10],
+            symbol=symbol_code,
+            rz_balance=_to_float(row.get("RZYE")),
+            rz_buy=_to_float(row.get("RZMRE")),
+            rz_repay=_to_float(row.get("RZCHE")),
+            rq_balance=_to_float(row.get("RQYE")),
+            rq_sell_vol=_to_float(row.get("RQMCL")),
+            rq_repay_vol=_to_float(row.get("RQCHL")),
+            total_balance=_to_float(row.get("RZRQYE")),
+        )
+    except Exception as e:
+        logger.debug(f"解析融资融券行失败 symbol={symbol_code}: {e}")
+        return None
 
 
 # ============================== 股东户数(按 symbol) ==============================

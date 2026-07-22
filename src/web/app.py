@@ -1,5 +1,10 @@
-from fastapi import FastAPI, Depends
+import os
+
+from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+
+from src.web.database import DB_PATH
 
 from src.web.api import (
     stocks,
@@ -26,6 +31,7 @@ from src.web.api import (
     dashboard,
     paper_trading,
     chat,
+    playbooks,
 )
 from src.web.api import factors
 from src.web.api import health
@@ -171,6 +177,12 @@ app.include_router(
     tags=["chat"],
     dependencies=protected,
 )
+app.include_router(
+    playbooks.router,
+    prefix="/api",
+    tags=["playbooks"],
+    dependencies=protected,
+)
 
 
 @app.get("/api/health")
@@ -182,3 +194,34 @@ async def health():
 async def version():
     """获取应用版本号（公开接口）"""
     return {"version": get_app_version()}
+
+
+# ---------------------------------------------------------------------------
+# 研究报告下载（P4）：必须避开 /api/ 前缀——ResponseWrapper 会整体缓冲大响应。
+# 鉴权与 server.py 的静态文件服务保持一致（不强制登录）。
+# ---------------------------------------------------------------------------
+REPORTS_DIR = os.path.join(os.path.dirname(DB_PATH), "reports")
+
+
+@app.get("/reports/{filename}")
+async def download_report(filename: str):
+    """从 data/reports/ 下载研究报告附件（如 docx）。
+
+    安全：仅允许 basename，拒绝含 ".." / "/" / "\\" 的输入，防路径穿越。
+    """
+    if (
+        not filename
+        or filename in (".", "..")
+        or ".." in filename
+        or "/" in filename
+        or "\\" in filename
+        or os.path.basename(filename) != filename
+    ):
+        raise HTTPException(status_code=400, detail="非法文件名")
+    file_path = os.path.join(REPORTS_DIR, filename)
+    # 双保险：解析后的真实路径必须仍在 reports 目录内
+    if not os.path.realpath(file_path).startswith(os.path.realpath(REPORTS_DIR)):
+        raise HTTPException(status_code=400, detail="非法文件名")
+    if not os.path.isfile(file_path):
+        raise HTTPException(status_code=404, detail="文件不存在")
+    return FileResponse(file_path, filename=filename)

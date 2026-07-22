@@ -124,7 +124,7 @@ def fetch_eastmoney_kline(secid: str, days: int) -> list[Bar]:
         _EASTMONEY_URL, host_key="push2his.eastmoney.com", min_interval_s=0.2,
         params={"secid": secid, "klt": "101", "fqt": "1",
                 "lmt": str(min(max(int(days or 1), 1200), 20000)), "end": "20500101",
-                "fields1": "f1,f2,f3,f4,f5,f6", "fields2": "f51,f52,f53,f54,f55,f56",
+                "fields1": "f1,f2,f3,f4,f5,f6", "fields2": "f51,f52,f53,f54,f55,f56,f57",
                 "ut": "fa5fd1943c7b386f172d6893dbfba10b"},
         headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"},
         timeout=12, retries=1, parse="json", log_label="东财K线", symbol=secid,
@@ -136,11 +136,34 @@ def fetch_eastmoney_kline(secid: str, days: int) -> list[Bar]:
         if len(p) < 6:
             continue
         try:
+            # f57=成交额(元);老响应/异常行可能只有 6 段 → turnover 保持 None,不伪造
+            turnover = float(p[6]) if len(p) > 6 and p[6] not in ("", "-") else None
             out.append(Bar(date=p[0], open=float(p[1]), close=float(p[2]),
-                           high=float(p[3]), low=float(p[4]), volume=float(p[5])))
+                           high=float(p[3]), low=float(p[4]), volume=float(p[5]),
+                           turnover=turnover))
         except Exception:
             continue
     return out
+
+
+def fetch_eastmoney_board_klines(board_code: str, days: int) -> list[Bar]:
+    """按板块代码(BKxxxx)取东财板块日K(secid=90.BKxxxx)。返回 list[Bar]。
+
+    板块与个股/指数一样走 push2his kline 端点,仅 secid 前缀固定为 90。
+    code 非法(非 BK+数字)直接返回 [],不发请求。
+    """
+    code = normalize_board_code(board_code)
+    if not code:
+        return []
+    return fetch_eastmoney_kline(f"90.{code}", days)
+
+
+def normalize_board_code(board_code: str) -> str:
+    """板块代码归一化:去空白、转大写,校验 BK+数字 形态;非法返回 ""。"""
+    code = (board_code or "").strip().upper()
+    if len(code) > 2 and code.startswith("BK") and code[2:].isdigit():
+        return code
+    return ""
 
 
 class EastmoneyKlineVendor(KlineVendor):

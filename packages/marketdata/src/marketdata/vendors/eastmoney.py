@@ -124,3 +124,34 @@ class EastmoneyQuoteVendor(QuoteVendor):
             if q:
                 out.append(q)
         return out
+
+
+def fetch_eastmoney_board_quote(board_code: str) -> Quote | None:
+    """按板块代码(BKxxxx)取东财板块实时行情(secid=90.BKxxxx),返回 Quote | None。
+
+    板块与个股同走 push2 stock/get 端点,仅 secid 前缀固定为 90;
+    复用 _parse_one 的字段映射(f43/f57/f58/f59/f60/f169/f170/f47/f48…),
+    板块无换手率/市值等概念,对应字段按接口实际返回填充(通常为 None,不伪造)。
+    code 非法(非 BK+数字)直接返回 None,不发请求。
+    """
+    from marketdata.vendors.kline import normalize_board_code
+
+    code = normalize_board_code(board_code)
+    if not code:
+        return None
+    payload = market_get(
+        _URL,
+        host_key=_HOST,
+        min_interval_s=_MIN_INTERVAL_S,
+        params={"secid": f"90.{code}", "fields": _FIELDS},
+        headers=_HEADERS,
+        timeout=8,
+        retries=2,
+        parse="json",
+        log_label="东财板块行情",
+        symbol=code,
+    )
+    if not payload:
+        return None
+    data = payload.get("data") if isinstance(payload, dict) else None
+    return _parse_one(data, "CN", code)

@@ -30,9 +30,13 @@ def _format_datetime(dt) -> str:
 
 
 class AlertConditionItem(BaseModel):
-    type: str = Field(..., description="price/change_pct/turnover/volume/volume_ratio")
+    type: str = Field(
+        ...,
+        description="price/change_pct/turnover/volume/volume_ratio/turnover_rate/capital_flow/consecutive_close",
+    )
     op: str = Field(..., description=">=/<=/>/</==/between")
     value: float | list[float] = Field(..., description="阈值")
+    days: int | None = Field(default=None, description="连续天数(仅 consecutive_close, 1-10)")
 
 
 class AlertConditionGroup(BaseModel):
@@ -51,6 +55,7 @@ class PriceAlertCreate(BaseModel):
     repeat_mode: str = "repeat"
     expire_at: str | None = None
     notify_channel_ids: list[int] = []
+    playbook_id: int | None = None
 
 
 class PriceAlertUpdate(BaseModel):
@@ -63,6 +68,7 @@ class PriceAlertUpdate(BaseModel):
     repeat_mode: str | None = None
     expire_at: str | None = None
     notify_channel_ids: list[int] | None = None
+    playbook_id: int | None = None
 
 
 class ToggleBody(BaseModel):
@@ -74,7 +80,10 @@ def _validate_condition_group(group: AlertConditionGroup):
         raise HTTPException(400, "condition_group.op 仅支持 and/or")
     if not group.items:
         raise HTTPException(400, "condition_group.items 不能为空")
-    allowed_types = {"price", "change_pct", "turnover", "volume", "volume_ratio"}
+    allowed_types = {
+        "price", "change_pct", "turnover", "volume", "volume_ratio",
+        "turnover_rate", "capital_flow", "consecutive_close",
+    }
     allowed_ops = {">=", "<=", ">", "<", "==", "=", "!=", "<>", "between", "in"}
     for it in group.items:
         if it.type not in allowed_types:
@@ -84,6 +93,27 @@ def _validate_condition_group(group: AlertConditionGroup):
         if it.op in ("between", "in"):
             if not isinstance(it.value, list) or len(it.value) != 2:
                 raise HTTPException(400, f"{it.type} 的 {it.op} 需要两个值")
+        if it.type == "turnover_rate" and it.op not in (">=", "<=", ">", "<", "between", "in"):
+            raise HTTPException(400, "turnover_rate 仅支持 >=/<=/>/</between")
+        if it.type == "consecutive_close":
+            if it.days is None or not (1 <= int(it.days) <= 10):
+                raise HTTPException(400, "consecutive_close 需要 days 参数（1-10）")
+
+
+def _validate_playbook(db: Session, playbook_id: int | None, stock_id: int | None):
+    """校验关联方案存在且属于该股票（playbook_id 可空）。"""
+    if playbook_id is None:
+        return
+    try:
+        from src.web.models import StockPlaybook
+    except Exception:
+        logger.warning("StockPlaybook 模型不可用，跳过 playbook_id 存在性校验")
+        return
+    pb = db.query(StockPlaybook).filter(StockPlaybook.id == playbook_id).first()
+    if not pb:
+        raise HTTPException(400, "关联方案不存在")
+    if stock_id is not None and pb.stock_id != stock_id:
+        raise HTTPException(400, "关联方案不属于该股票")
 
 
 def _to_response(rule: PriceAlertRule) -> dict:
@@ -103,6 +133,7 @@ def _to_response(rule: PriceAlertRule) -> dict:
         "repeat_mode": rule.repeat_mode,
         "expire_at": _format_datetime(rule.expire_at) or None,
         "notify_channel_ids": rule.notify_channel_ids or [],
+        "playbook_id": getattr(rule, "playbook_id", None),
         "last_trigger_at": _format_datetime(rule.last_trigger_at) or None,
         "last_trigger_price": rule.last_trigger_price,
         "trigger_count_today": rule.trigger_count_today or 0,
@@ -129,6 +160,7 @@ def create_alert_rule(body: PriceAlertCreate, db: Session = Depends(get_db)):
     if not stock:
         raise HTTPException(404, "股票不存在")
     _validate_condition_group(body.condition_group)
+    _validate_playbook(db, body.playbook_id, body.stock_id)
 
     expire_at = None
     if body.expire_at:
@@ -149,6 +181,9 @@ def create_alert_rule(body: PriceAlertCreate, db: Session = Depends(get_db)):
         expire_at=expire_at,
         notify_channel_ids=body.notify_channel_ids or [],
     )
+    # playbook_id 列由迁移 v119 提供；setattr 兼容列尚未建出的环境。
+    if body.playbook_id is not None:
+        setattr(row, "playbook_id", body.playbook_id)
     db.add(row)
     db.commit()
     db.refresh(row)
@@ -165,6 +200,8 @@ def update_alert_rule(rule_id: int, body: PriceAlertUpdate, db: Session = Depend
     if "condition_group" in updates and body.condition_group:
         _validate_condition_group(body.condition_group)
         updates["condition_group"] = body.condition_group.model_dump()
+    if "playbook_id" in updates:
+        _validate_playbook(db, updates.get("playbook_id"), row.stock_id)
     if "cooldown_minutes" in updates:
         updates["cooldown_minutes"] = max(0, int(updates["cooldown_minutes"]))
     if "max_triggers_per_day" in updates:

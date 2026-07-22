@@ -28,6 +28,9 @@ class PositionInfo:
     quantity: int
     invested_amount: float | None = None
     trading_style: str = "swing"  # short: 短线, swing: 波段, long: 长线
+    # 近期交易流水(P3a v1.5):当日全部 + 近 10 笔,字段 日期/方向/价/量/费/realized_pnl/note
+    trades: list[dict] = field(default_factory=list)
+    trades_text: str = ""  # 紧凑文本(≤200 token/股;无流水为空串)
 
     @property
     def cost_value(self) -> float:
@@ -200,6 +203,9 @@ class BaseAgent(ABC):
         """
 
         if self.name in ("daily_report", "premarket_outlook"):
+            default = 12 * 60
+        elif self.name in ("morning_brief", "tail_brief"):
+            # 早盘/尾盘简报每日各一次,同日重复触发(手动/重启)不重复推送
             default = 12 * 60
         elif self.name == "news_digest":
             default = 60

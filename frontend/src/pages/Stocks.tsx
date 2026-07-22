@@ -1,10 +1,13 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
-import { Plus, Trash2, Pencil, Search, X, TrendingUp, Bot, Play, RefreshCw, Wallet, PiggyBank, ArrowUpRight, ArrowDownRight, Building2, ChevronDown, ChevronRight, Cpu, Bell, Clock, Newspaper, ExternalLink, BarChart3, Brain } from 'lucide-react'
+import { Plus, Trash2, Pencil, Search, X, TrendingUp, TrendingDown, Receipt, Bot, Play, RefreshCw, Wallet, PiggyBank, ArrowUpRight, ArrowDownRight, Building2, ChevronDown, ChevronRight, Cpu, Bell, Clock, Newspaper, ExternalLink, BarChart3, Brain } from 'lucide-react'
 import { fetchAPI, stocksApi, type AIService, type NotifyChannel } from '@panwatch/api'
 import { useLocalStorage } from '@/lib/utils'
 import { SuggestionBadge, type SuggestionInfo, type KlineSummary } from '@panwatch/biz-ui/components/suggestion-badge'
 import { buildKlineSuggestion } from '@/lib/kline-scorer'
 import { KlineSummaryDialog } from '@panwatch/biz-ui/components/kline-summary-dialog'
+import PositionTradeDialog from '@/components/PositionTradeDialog'
+import PositionTradesDrawer from '@/components/PositionTradesDrawer'
+import StockPlaybookPanel from '@/components/StockPlaybookPanel'
 import { Button } from '@panwatch/base-ui/components/ui/button'
 import { Input } from '@panwatch/base-ui/components/ui/input'
 import { Label } from '@panwatch/base-ui/components/ui/label'
@@ -72,6 +75,8 @@ interface Position {
   daily_pnl: number | null
   daily_pnl_pct: number | null
   exchange_rate: number | null  // 汇率（仅港股）
+  realized_pnl_total?: number  // 已实现盈亏合计（Phase 1 交易流水）
+  trade_count?: number  // 交易流水笔数
 }
 
 interface AccountSummary {
@@ -84,6 +89,7 @@ interface AccountSummary {
   total_pnl_pct: number
   total_daily_pnl: number
   total_assets: number
+  realized_pnl?: number  // 已实现盈亏（Phase 1）
   positions: Position[]
 }
 
@@ -97,6 +103,7 @@ interface PortfolioSummary {
     total_daily_pnl: number
     available_funds: number
     total_assets: number
+    realized_pnl?: number  // 已实现盈亏（Phase 1）
   }
   exchange_rates?: {
     HKD_CNY: number
@@ -314,6 +321,9 @@ const mergePortfolioQuotes = (
   const grandPnl = grandMarketValue - grandCost
   const grandPnlPct = grandCost > 0 ? (grandPnl / grandCost * 100) : 0
   const grandTotalAssets = grandMarketValue + grandAvailable
+  // 已实现盈亏与行情无关，直接透传后端值；缺失时按账户求和兜底
+  const grandRealizedPnl = portfolio.total.realized_pnl
+    ?? accounts.reduce((sum, a) => sum + (a.realized_pnl ?? 0), 0)
 
   return {
     ...portfolio,
@@ -326,6 +336,7 @@ const mergePortfolioQuotes = (
       total_daily_pnl: round2(grandDailyPnl),
       available_funds: round2(grandAvailable),
       total_assets: round2(grandTotalAssets),
+      realized_pnl: round2(grandRealizedPnl),
     },
   }
 }
@@ -420,6 +431,10 @@ export default function StocksPage() {
   const [showPositionDropdown, setShowPositionDropdown] = useState(false)
   const positionSearchTimer = useRef<ReturnType<typeof setTimeout>>()
   const positionDropdownRef = useRef<HTMLDivElement>(null)
+
+  // 持仓交易流水（Phase 1）：录入弹窗 + 流水列表
+  const [tradeDialogState, setTradeDialogState] = useState<{ position: Position; direction: 'buy' | 'sell' } | null>(null)
+  const [tradesDrawerPosition, setTradesDrawerPosition] = useState<Position | null>(null)
 
   // Agent dialog
   const [agentDialogStock, setAgentDialogStock] = useState<Stock | null>(null)
@@ -1222,6 +1237,20 @@ export default function StocksPage() {
     }
   }
 
+  // ========== Position trade handlers (Phase 1 交易流水) ==========
+  const openTradeDialog = (pos: Position, direction: 'buy' | 'sell') => {
+    setTradeDialogState({ position: pos, direction })
+  }
+
+  const openTradesDrawer = (pos: Position) => {
+    setTradesDrawerPosition(pos)
+  }
+
+  const handleTradeSuccess = () => {
+    setTradeDialogState(null)
+    loadPortfolio()
+  }
+
   // ========== Agent handlers ==========
   const toggleAgent = async (stock: Stock, agentName: string) => {
     try {
@@ -1659,6 +1688,13 @@ export default function StocksPage() {
                 ({portfolio.total.total_pnl_pct >= 0 ? '+' : ''}{portfolio.total.total_pnl_pct.toFixed(2)}%)
               </span>
             </div>
+            {portfolio.total.realized_pnl != null && (
+              <div className="mt-1 text-[11px] text-muted-foreground">
+                已实现 <span className={`font-mono ${portfolio.total.realized_pnl >= 0 ? 'text-rose-500' : 'text-emerald-500'}`}>
+                  {portfolio.total.realized_pnl >= 0 ? '+' : ''}{formatMoney(portfolio.total.realized_pnl)}
+                </span>
+              </div>
+            )}
           </div>
 
           {(() => {
@@ -2028,7 +2064,16 @@ export default function StocksPage() {
                                       <div className="flex flex-col items-end">
                                         <span>{pos.pnl >= 0 ? '+' : ''}{formatMoney(pos.pnl)}</span>
                                         <span className="text-[10px] opacity-70">{pos.pnl_pct != null ? `${pos.pnl_pct >= 0 ? '+' : ''}${pos.pnl_pct.toFixed(2)}%` : ''}{isForeign && ' CNY'}</span>
+                                        {(pos.trade_count ?? 0) > 0 && pos.realized_pnl_total != null && (
+                                          <span className={`text-[10px] ${pos.realized_pnl_total >= 0 ? 'text-rose-500/80' : 'text-emerald-500/80'}`}>
+                                            已落 {pos.realized_pnl_total >= 0 ? '+' : ''}{formatMoney(pos.realized_pnl_total)}
+                                          </span>
+                                        )}
                                       </div>
+                                    ) : (pos.trade_count ?? 0) > 0 && pos.realized_pnl_total != null ? (
+                                      <span className={`text-[11px] ${pos.realized_pnl_total >= 0 ? 'text-rose-500' : 'text-emerald-500'}`}>
+                                        已落 {pos.realized_pnl_total >= 0 ? '+' : ''}{formatMoney(pos.realized_pnl_total)}
+                                      </span>
                                     ) : '—'}
                                   </td>
                                   <td className={`px-4 py-2.5 text-right font-mono text-[12px] ${pos.daily_pnl != null ? (pos.daily_pnl >= 0 ? 'text-rose-500' : 'text-emerald-500') : ''}`}>
@@ -2077,6 +2122,9 @@ export default function StocksPage() {
                                   </td>
                                   <td className="px-4 py-2.5 text-center">
                                     <div className="flex items-center justify-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                                      <Button variant="ghost" size="icon" className="h-7 w-7 hover:text-rose-500" onClick={() => openTradeDialog(pos, 'buy')} title="加仓（买入）"><TrendingUp className="w-3 h-3" /></Button>
+                                      <Button variant="ghost" size="icon" className="h-7 w-7 hover:text-emerald-500" onClick={() => openTradeDialog(pos, 'sell')} title="减仓（卖出）"><TrendingDown className="w-3 h-3" /></Button>
+                                      <Button variant="ghost" size="icon" className="h-7 w-7 hover:text-primary" onClick={() => openTradesDrawer(pos)} title={`交易流水${pos.trade_count != null ? `（${pos.trade_count} 笔）` : ''}`}><Receipt className="w-3 h-3" /></Button>
                                       {(() => { const { suggestion, kline } = getSuggestionForStock(pos.symbol, pos.market, true); return (!suggestion && !kline) ? (
                                         <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => openKlineDialog(pos.symbol, pos.market, pos.name, true)} title="K线指标"><BarChart3 className="w-3 h-3" /></Button>
                                       ) : null })()}
@@ -2243,6 +2291,9 @@ export default function StocksPage() {
                                   )}
                                 </div>
                                 <div className="flex items-center gap-1">
+                                  <Button variant="ghost" size="icon" className="h-7 w-7 hover:text-rose-500" onClick={() => openTradeDialog(pos, 'buy')} title="加仓（买入）"><TrendingUp className="w-3 h-3" /></Button>
+                                  <Button variant="ghost" size="icon" className="h-7 w-7 hover:text-emerald-500" onClick={() => openTradeDialog(pos, 'sell')} title="减仓（卖出）"><TrendingDown className="w-3 h-3" /></Button>
+                                  <Button variant="ghost" size="icon" className="h-7 w-7 hover:text-primary" onClick={() => openTradesDrawer(pos)} title="交易流水"><Receipt className="w-3 h-3" /></Button>
                                   {(() => { const { suggestion, kline } = getSuggestionForStock(pos.symbol, pos.market, true); return (!suggestion && !kline) ? (
                                     <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => openKlineDialog(pos.symbol, pos.market, pos.name, true)} title="K线指标"><BarChart3 className="w-3 h-3" /></Button>
                                   ) : null })()}
@@ -2521,6 +2572,15 @@ export default function StocksPage() {
         market={insightMarket}
         stockName={insightName}
         hasPosition={insightHasPosition}
+        renderPlaybook={(ctx) => (
+          <StockPlaybookPanel
+            key={ctx.stockId ?? `${ctx.market}:${ctx.symbol}`}
+            stockId={ctx.stockId}
+            symbol={ctx.symbol}
+            market={ctx.market}
+            stockName={ctx.stockName}
+          />
+        )}
       />
 
       {/* TradingAgents 深度分析弹窗 */}
@@ -3129,6 +3189,24 @@ export default function StocksPage() {
           </div>
         </DialogContent>
       </Dialog>
+
+      {/* 持仓交易流水（Phase 1）：录入弹窗 + 流水列表 */}
+      <PositionTradeDialog
+        open={!!tradeDialogState}
+        onOpenChange={(open) => { if (!open) setTradeDialogState(null) }}
+        position={tradeDialogState?.position ?? null}
+        direction={tradeDialogState?.direction ?? 'buy'}
+        onSuccess={handleTradeSuccess}
+      />
+      <PositionTradesDrawer
+        open={!!tradesDrawerPosition}
+        onOpenChange={(open) => { if (!open) setTradesDrawerPosition(null) }}
+        position={
+          tradesDrawerPosition
+            ? (portfolioRaw?.accounts.flatMap(a => a.positions).find(p => p.id === tradesDrawerPosition.id) ?? tradesDrawerPosition)
+            : null
+        }
+      />
     </div>
   )
 }

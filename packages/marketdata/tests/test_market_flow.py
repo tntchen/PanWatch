@@ -413,3 +413,88 @@ class TestClientMethods:
         md = MarketData(config=StaticConfigProvider({}))
         out = md.margin(["600519"], market="CN")
         assert out == []
+
+
+# ---------------------------------------------------------------------------
+# 融资融券序列模式(series=True,P3e:融资余额周度趋势)
+# ---------------------------------------------------------------------------
+
+class TestMarginSeries:
+    def _row(self, date: str, rz: float):
+        return {
+            "DATE": date,
+            "RZYE": rz,
+            "RZMRE": 300000000.0,
+            "RZCHE": 250000000.0,
+            "RQYE": 80000000.0,
+            "RQMCL": 1000000.0,
+            "RQCHL": 900000.0,
+            "RZRQYE": rz + 80000000.0,
+        }
+
+    def test_series_returns_all_rows(self, monkeypatch):
+        rows = [self._row("2026-07-16", 5.0e9), self._row("2026-07-15", 4.9e9),
+                self._row("2026-07-14", 4.8e9)]
+        monkeypatch.setattr(mf, "market_get", lambda *a, **k: _datacenter_payload(rows))
+        out = mf.EastmoneyMarginVendor().fetch(
+            [Symbol.parse("600519", market="CN")], {"series": True}
+        )
+        assert len(out) == 3 and all(isinstance(x, MarginItem) for x in out)
+        assert [x.date for x in out] == ["2026-07-16", "2026-07-15", "2026-07-14"]
+        assert [x.rz_balance for x in out] == [5.0e9, 4.9e9, 4.8e9]
+
+    def test_default_mode_still_snapshot_only(self, monkeypatch):
+        """不传 series 时行为不变:多只多日仍只取每只最新一条。"""
+        rows = [self._row("2026-07-16", 5.0e9), self._row("2026-07-15", 4.9e9)]
+        monkeypatch.setattr(mf, "market_get", lambda *a, **k: _datacenter_payload(rows))
+        out = mf.EastmoneyMarginVendor().fetch([Symbol.parse("600519", market="CN")], {})
+        assert len(out) == 1 and out[0].date == "2026-07-16"
+
+    def test_series_days_controls_page_size(self, monkeypatch):
+        captured = {}
+
+        def fake_market_get(url, *, params=None, **kwargs):
+            captured["pageSize"] = (params or {}).get("pageSize")
+            return _datacenter_payload([self._row("2026-07-16", 5.0e9)])
+
+        monkeypatch.setattr(mf, "market_get", fake_market_get)
+        mf.EastmoneyMarginVendor().fetch(
+            [Symbol.parse("600519", market="CN")], {"series": True, "days": 7}
+        )
+        assert captured["pageSize"] == 7
+
+        captured.clear()
+        mf.EastmoneyMarginVendor().fetch(
+            [Symbol.parse("600519", market="CN")], {"series": True, "days": 99999}
+        )
+        assert captured["pageSize"] == 200  # 钳制上限
+
+    def test_series_broken_row_skipped_not_raised(self, monkeypatch):
+        rows = [None, self._row("2026-07-15", 4.9e9)]
+        monkeypatch.setattr(mf, "market_get", lambda *a, **k: _datacenter_payload(rows))
+        out = mf.EastmoneyMarginVendor().fetch(
+            [Symbol.parse("600519", market="CN")], {"series": True}
+        )
+        assert len(out) == 1 and out[0].date == "2026-07-15"
+
+    def test_client_margin_series_via_engine(self, monkeypatch):
+        rows = [self._row("2026-07-16", 5.0e9), self._row("2026-07-15", 4.9e9)]
+        monkeypatch.setattr(mf, "market_get", lambda *a, **k: _datacenter_payload(rows))
+
+        md = MarketData(config=StaticConfigProvider({
+            "margin": [SourceConfig(vendor="eastmoney", priority=1)],
+        }))
+        out = md.margin_series(["600519"], market="CN", days=10)
+        assert len(out) == 2
+        assert [x.date for x in out] == ["2026-07-16", "2026-07-15"]
+
+    def test_client_margin_snapshot_unaffected(self, monkeypatch):
+        """margin() 快照语义不受 series 模式影响。"""
+        rows = [self._row("2026-07-16", 5.0e9), self._row("2026-07-15", 4.9e9)]
+        monkeypatch.setattr(mf, "market_get", lambda *a, **k: _datacenter_payload(rows))
+
+        md = MarketData(config=StaticConfigProvider({
+            "margin": [SourceConfig(vendor="eastmoney", priority=1)],
+        }))
+        out = md.margin(["600519"], market="CN")
+        assert len(out) == 1 and out[0].date == "2026-07-16"

@@ -129,6 +129,42 @@ class Position(Base):
 
     account = relationship("Account", back_populates="positions")
     stock = relationship("Stock", back_populates="positions")
+    trades = relationship(
+        "PositionTrade",
+        back_populates="position",
+        cascade="all, delete-orphan",
+        order_by="PositionTrade.traded_at",
+    )
+
+
+class PositionTrade(Base):
+    """持仓交易流水（buy/sell/adjustment）——持仓交易化 Phase 1
+
+    语义约定（doc/12 §3）：
+    - 关仓 = quantity=0 保留行，流水不被清空；有流水的持仓禁止删除（API 层拦截）。
+    - realized_pnl 仅 sell 流水有值；buy/adjustment 为 None。
+    - adjustment 由「手动编辑成本/数量」自动生成，不联动资金。
+    """
+
+    __tablename__ = "position_trades"
+    __table_args__ = (
+        Index("ix_position_trades_pos_time", "position_id", "traded_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    position_id = Column(
+        Integer, ForeignKey("positions.id", ondelete="CASCADE"), nullable=False
+    )
+    direction = Column(String, nullable=False)  # buy / sell / adjustment
+    price = Column(Float, nullable=False)
+    quantity = Column(Integer, nullable=False)
+    fee = Column(Float, nullable=False, default=0.0)
+    traded_at = Column(DateTime, nullable=False)
+    realized_pnl = Column(Float, nullable=True)  # 仅 sell 有值
+    note = Column(String, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+    position = relationship("Position", back_populates="trades")
 
 
 class StockAgent(Base):
@@ -933,6 +969,8 @@ class PriceAlertRule(Base):
     last_trigger_price = Column(Float, nullable=True)
     trigger_count_today = Column(Integer, default=0)
     trigger_date = Column(String, default="")  # YYYY-MM-DD
+    # 关联方案档案（P2a 新增可空列；存量库由 v119 版本化迁移补列，与迁移 SQL 一致不带 FK）
+    playbook_id = Column(Integer, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
@@ -967,6 +1005,36 @@ class PriceAlertHit(Base):
     created_at = Column(DateTime, server_default=func.now())
 
     rule = relationship("PriceAlertRule")
+    stock = relationship("Stock")
+
+
+class StockPlaybook(Base):
+    """个股方案档案（stock_playbooks）—— Phase 2 P2a
+
+    语义约定（doc/12 §3 + 四方契约 A）：
+    - payload 为契约 A JSON，含 schema_version 信封；演进只增不改，loader 容错读取。
+    - 每只股票多版本，(stock_id, version) 唯一；同一时刻至多一个 is_active=True。
+    - 新表走 create_all 建表，不用版本化迁移。
+    - summary 由后端从 payload 生成（≤500 token），供列表接口与 Agent prompt 注入。
+    """
+
+    __tablename__ = "stock_playbooks"
+    __table_args__ = (
+        UniqueConstraint("stock_id", "version", name="uq_stock_playbook_version"),
+        Index("ix_stock_playbook_stock_active", "stock_id", "is_active"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    stock_id = Column(
+        Integer, ForeignKey("stocks.id", ondelete="CASCADE"), nullable=False
+    )
+    version = Column(Integer, nullable=False)
+    is_active = Column(Boolean, default=False)
+    payload = Column(JSON, default={})
+    summary = Column(Text, default="")
+    note = Column(String, default="")
+    created_at = Column(DateTime, server_default=func.now())
+
     stock = relationship("Stock")
 
 

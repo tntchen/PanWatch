@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import ReactMarkdown from 'react-markdown'
 import { Copy, Download, ExternalLink, RefreshCw, Share2, Sparkles } from 'lucide-react'
 import {
@@ -110,7 +110,16 @@ interface PortfolioSummaryResponse {
   }>
 }
 
-type InsightTab = 'overview' | 'kline' | 'suggestions' | 'news' | 'announcements' | 'reports' | 'deep'
+type InsightTab = 'overview' | 'kline' | 'suggestions' | 'news' | 'announcements' | 'reports' | 'deep' | 'playbook'
+
+/** 方案 Tab 插槽上下文（由宿主页面注入 StockPlaybookPanel，biz-ui 不反向依赖 app 代码） */
+export interface PlaybookSlotContext {
+  /** stocks 表 id；null 表示未关注 */
+  stockId: number | null
+  symbol: string
+  market: string
+  stockName?: string
+}
 
 interface StockAgentInfo {
   agent_name: string
@@ -337,6 +346,8 @@ export default function StockInsightModal(props: {
   market: string
   stockName?: string
   hasPosition?: boolean
+  /** 可选：提供后出现「方案」Tab，内容由宿主渲染（如 StockPlaybookPanel） */
+  renderPlaybook?: (ctx: PlaybookSlotContext) => ReactNode
 }) {
   const { toast } = useToast()
   const symbol = String(props.symbol || '').trim()
@@ -1384,6 +1395,7 @@ export default function StockInsightModal(props: {
                 { id: 'reports', label: `报告 (${reports.length})` },
                 { id: 'deep', label: deepResult ? '深度 (1)' : '深度' },
                 { id: 'kline', label: 'K线' },
+                ...(props.renderPlaybook ? [{ id: 'playbook', label: '方案' }] : []),
                 { id: 'announcements', label: `公告 (${announcements.length})` },
                 { id: 'news', label: `新闻 (${news.length})` },
               ].map(item => (
@@ -1888,6 +1900,16 @@ export default function StockInsightModal(props: {
                     </a>
                   ))
                 )}
+              </div>
+            )}
+            {tab === 'playbook' && props.renderPlaybook && (
+              <div>
+                {props.renderPlaybook({
+                  stockId: watchingStock?.id ?? null,
+                  symbol,
+                  market,
+                  stockName: resolvedName,
+                })}
               </div>
             )}
 

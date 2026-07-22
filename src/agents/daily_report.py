@@ -1,7 +1,10 @@
 import logging
 import re
-from datetime import datetime
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+from sqlalchemy import func
 
 from src.agents.base import BaseAgent, AgentContext, AnalysisResult
 from src.core.analysis_history import save_analysis
@@ -12,6 +15,7 @@ from src.core.context_store import (
     save_agent_context_run,
     save_agent_prediction_outcome,
 )
+from src.core.playbook import get_trigger_hint, load_active_playbook
 from src.core.signals import SignalPackBuilder
 from src.core.signals.structured_output import (
     TAG_START,
@@ -19,6 +23,14 @@ from src.core.signals.structured_output import (
     try_extract_tagged_json,
 )
 from src.models.market import MarketCode, IndexData
+from src.web.database import SessionLocal
+from src.web.models import (
+    Position,
+    PositionTrade,
+    PriceAlertHit,
+    PriceAlertRule,
+    Stock,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +45,51 @@ DAILY_ACTION_MAP = {
 }
 
 PROMPT_PATH = Path(__file__).parent.parent.parent / "prompts" / "daily_report.txt"
+
+# 条件注入段标记（P3b）：prompt 文件中此标记之后的内容（方案档案/龙虎榜章节
+# 模板）仅在当日存在对应数据时才拼进 system prompt，保证无档案股票的 prompt
+# 与改造前逐字一致（零漂移硬约束，快照断言见 tests/test_daily_report_playbook.py）。
+_CONDITIONAL_MARKER = "<!--PANWATCH_CONDITIONAL_SECTIONS-->"
+
+
+def _load_prompt_parts() -> tuple[str, str]:
+    """读取 prompt 模板并拆成 (基础段, 条件段)。无标记时条件段为空串。"""
+    raw = PROMPT_PATH.read_text(encoding="utf-8")
+    base, sep, conditional = raw.partition(_CONDITIONAL_MARKER)
+    if not sep:
+        return raw, ""
+    return base, sep + conditional
+
+
+def md_dragon_tiger(date: str | None = None, market: str = "CN") -> list[dict]:
+    """惰性 import,避免包未装/循环 import 影响本模块加载。"""
+    from src.core.marketdata_client import md_dragon_tiger as _mdt
+
+    return _mdt(date=date, market=market)
+
+
+def _local_tzinfo():
+    """应用本地时区（与 price_alerts 今日命中口径一致）。"""
+    from src.config import Settings
+
+    tz_name = Settings().app_timezone or "UTC"
+    try:
+        return ZoneInfo(tz_name)
+    except Exception:
+        return timezone.utc
+
+
+def _today_start_utc_naive() -> datetime:
+    """今日本地零点对应的 UTC naive 时间。
+
+    price_alert_hits.trigger_time 由告警引擎以 UTC naive 落库，
+    「当日命中」需把本地零点换算到 UTC naive 再比较（同 price_alerts.py）。
+    """
+    tzinfo = _local_tzinfo()
+    local_midnight = datetime.now(tzinfo).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    return local_midnight.astimezone(timezone.utc).replace(tzinfo=None)
 
 # A 股大盘指数的显式腾讯符号（与 akshare_collector.CN_INDICES 口径一致）
 _CN_INDEX_TENCENT_SYMBOLS = ["sh000001", "sz399001", "sz399006"]
@@ -122,17 +179,271 @@ class DailyReportAgent(BaseAgent):
         if not all_indices and not any(p.quote for p in packs.values()):
             raise RuntimeError("数据采集失败：未获取到任何行情数据，请检查网络连接")
 
+        symbol_contexts = context_pack.get("symbols", {})
+        # P3b:方案档案章节(仅有档案股票) + 龙虎榜(按自选股过滤),均容错
+        playbook_sections = self._build_playbook_sections(
+            context, packs, symbol_contexts
+        )
+        dragon_tiger = self._load_dragon_tiger(context)
+
         return {
             "indices": all_indices,
             "signal_packs": packs,
-            "symbol_contexts": context_pack.get("symbols", {}),
+            "symbol_contexts": symbol_contexts,
             "quality_overview": context_pack.get("quality_overview", {}),
+            "playbook_sections": playbook_sections,
+            "dragon_tiger": dragon_tiger,
             "timestamp": datetime.now().isoformat(),
+        }
+
+    def _load_dragon_tiger(self, context: AgentContext) -> list[dict]:
+        """龙虎榜:取当日市场级快照,按 watchlist 中 CN 个股过滤。
+
+        容错:无 CN 自选股/无备源/接口失败/当日无数据一律返回 [](记日志),
+        不中断报告生成(对应章节随后跳过)。
+        """
+        try:
+            cn_symbols = {
+                s.symbol for s in context.watchlist if s.market == MarketCode.CN
+            }
+            if not cn_symbols:
+                return []
+            today = datetime.now().strftime("%Y-%m-%d")
+            items = md_dragon_tiger(date=today, market="CN") or []
+            return [
+                it for it in items if str(it.get("symbol") or "") in cn_symbols
+            ]
+        except Exception as e:
+            logger.warning(f"龙虎榜数据获取失败,跳过该章节: {e}")
+            return []
+
+    def _build_playbook_sections(
+        self,
+        context: AgentContext,
+        packs: dict,
+        symbol_contexts: dict,
+    ) -> dict[str, dict]:
+        """为有方案档案的自选股构建档案章节数据 {symbol: section}。
+
+        以 P3a 注入的 symbol_contexts[*]["playbook"] 摘要为档案存在判据;
+        任何单股异常只跳过该股,整体 DB 异常则跳过全部(不中断报告)。
+        """
+        targets = [
+            w
+            for w in context.watchlist
+            if (symbol_contexts.get(w.symbol) or {}).get("playbook")
+        ]
+        if not targets:
+            return {}
+        sections: dict[str, dict] = {}
+        try:
+            db = SessionLocal()
+        except Exception as e:
+            logger.warning(f"方案档案章节:数据库会话创建失败,整体跳过: {e}")
+            return {}
+        try:
+            for w in targets:
+                try:
+                    section = self._build_one_playbook_section(
+                        db, w, context, packs, symbol_contexts
+                    )
+                except Exception as e:
+                    logger.warning(f"构建方案档案章节失败 {w.symbol}: {e}")
+                    continue
+                if section:
+                    sections[w.symbol] = section
+        finally:
+            db.close()
+        return sections
+
+    def _build_one_playbook_section(
+        self,
+        db,
+        w,
+        context: AgentContext,
+        packs: dict,
+        symbol_contexts: dict,
+    ) -> dict | None:
+        """单只股票的档案章节:触发器状态/持仓盈亏/次日预案依据/日历提醒。"""
+        summary = (symbol_contexts.get(w.symbol) or {}).get("playbook")
+        if not summary:
+            return None
+        market = w.market.value if isinstance(w.market, MarketCode) else str(w.market or "")
+        stock = (
+            db.query(Stock)
+            .filter(Stock.symbol == w.symbol, Stock.market == market)
+            .first()
+        )
+        pack = packs.get(w.symbol)
+        current_price = getattr(getattr(pack, "quote", None), "current_price", None)
+
+        section: dict = {
+            "summary": summary,
+            "triggers": [],
+            "position": None,
+            "calendar": [],
+        }
+        if stock is None:
+            return section
+
+        playbook = load_active_playbook(db, stock.id)
+        payload = (
+            playbook.payload if playbook and isinstance(playbook.payload, dict) else {}
+        )
+
+        # ✅ 触发器逐项状态:关联该档案的告警规则 + 当日 PriceAlertHit
+        if playbook is not None:
+            section["triggers"] = self._load_trigger_status(db, stock.id, playbook)
+        # 🗓 日历提醒:未来 30 天(含今天)日历项
+        section["calendar"] = self._extract_calendar(payload)
+        # 💰 持仓盈亏:流水精确口径(成本引擎维护的成本 + 已实现盈亏聚合)
+        section["position"] = self._load_position_pnl(
+            db, stock.id, w.symbol, context, current_price
+        )
+        return section
+
+    def _load_trigger_status(self, db, stock_id: int, playbook) -> list[dict]:
+        """档案关联告警规则的逐项当日状态(规则名/方案提示/是否触发/触发时间)。"""
+        rules = (
+            db.query(PriceAlertRule)
+            .filter(
+                PriceAlertRule.stock_id == stock_id,
+                PriceAlertRule.playbook_id == playbook.id,
+            )
+            .order_by(PriceAlertRule.id)
+            .all()
+        )
+        if not rules:
+            return []
+        start_utc = _today_start_utc_naive()
+        hits = (
+            db.query(PriceAlertHit)
+            .filter(
+                PriceAlertHit.rule_id.in_([r.id for r in rules]),
+                PriceAlertHit.trigger_time >= start_utc,
+            )
+            .order_by(PriceAlertHit.trigger_time)
+            .all()
+        )
+        tzinfo = _local_tzinfo()
+        hit_map: dict[int, list[str]] = {}
+        for h in hits:
+            ts = h.trigger_time
+            if ts is None:
+                continue
+            aware = ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts
+            hit_map.setdefault(h.rule_id, []).append(
+                aware.astimezone(tzinfo).strftime("%H:%M")
+            )
+        out = []
+        for r in rules:
+            hint = get_trigger_hint(db, playbook.id, r.name or "") or ""
+            times = hit_map.get(r.id, [])
+            out.append(
+                {
+                    "name": r.name or "提醒",
+                    "hint": hint,
+                    "enabled": bool(r.enabled),
+                    "triggered": bool(times),
+                    "times": times,
+                }
+            )
+        return out
+
+    @staticmethod
+    def _extract_calendar(payload: dict, horizon_days: int = 30) -> list[dict]:
+        """从档案 payload 提取未来 N 天(含今天)日历项,按日期升序。"""
+        cal = payload.get("calendar")
+        if not isinstance(cal, list):
+            return []
+        today = date.today()
+        horizon = today + timedelta(days=horizon_days)
+        out = []
+        for entry in cal:
+            if not isinstance(entry, dict):
+                continue
+            raw = str(entry.get("date") or "").strip()
+            event = str(entry.get("event") or "").strip()
+            if not raw or not event:
+                continue
+            try:
+                d = date.fromisoformat(raw[:10])
+            except ValueError:
+                continue
+            if not (today <= d <= horizon):
+                continue
+            out.append(
+                {
+                    "date": raw[:10],
+                    "event": event,
+                    "bias": str(entry.get("bias") or "").strip(),
+                    "plan": str(entry.get("plan") or "").strip(),
+                    "days_until": (d - today).days,
+                }
+            )
+        out.sort(key=lambda x: x["date"])
+        return out
+
+    @staticmethod
+    def _load_position_pnl(
+        db,
+        stock_id: int,
+        symbol: str,
+        context: AgentContext,
+        current_price,
+    ) -> dict | None:
+        """持仓盈亏(流水精确口径):浮动盈亏 + 成本引擎流水聚合的已实现盈亏。
+
+        不用简单 (现价-成本)*数量 敷衍:已实现盈亏来自 position_trades
+        (apply_sell 逐笔 realized_pnl 聚合),成本为流水维护的移动加权成本。
+        """
+        positions = [p for p in context.portfolio.all_positions if p.symbol == symbol]
+        realized = (
+            db.query(func.sum(PositionTrade.realized_pnl))
+            .join(Position, PositionTrade.position_id == Position.id)
+            .filter(Position.stock_id == stock_id)
+            .scalar()
+        )
+        realized_total = float(realized or 0.0)
+        if not positions:
+            return None
+
+        total_qty = sum(int(p.quantity or 0) for p in positions)
+        cost_value = sum(
+            float(p.cost_price or 0) * int(p.quantity or 0) for p in positions
+        )
+        avg_cost = cost_value / total_qty if total_qty > 0 else 0.0
+        floating = None
+        if current_price is not None and total_qty > 0:
+            floating = (float(current_price) - avg_cost) * total_qty
+        trades_text = "; ".join(
+            t for t in (p.trades_text for p in positions) if t
+        )
+        today_str = date.today().strftime("%Y-%m-%d")
+        has_today = any(
+            str(t.get("date") or "") == today_str
+            for p in positions
+            for t in (p.trades or [])
+        )
+        return {
+            "quantity": total_qty,
+            "avg_cost": avg_cost,
+            "floating_pnl": floating,
+            "realized_pnl": realized_total,
+            "trades_text": trades_text,
+            "has_today_trades": has_today,
         }
 
     def build_prompt(self, data: dict, context: AgentContext) -> tuple[str, str]:
         """构建日报 Prompt"""
-        system_prompt = PROMPT_PATH.read_text(encoding="utf-8")
+        base_prompt, conditional_prompt = _load_prompt_parts()
+        playbook_sections = data.get("playbook_sections") or {}
+        dragon_tiger_items = data.get("dragon_tiger") or []
+        # 零漂移硬约束:无方案档案且无龙虎榜数据时,system prompt 只用基础段,
+        # 与改造前逐字一致;有条件数据时才拼接条件段模板。
+        system_prompt = base_prompt + (
+            conditional_prompt if (playbook_sections or dragon_tiger_items) else ""
+        )
 
         # 辅助函数：安全获取数值，None 转为默认值
         def safe_num(value, default=0):
@@ -379,6 +690,17 @@ class DailyReportAgent(BaseAgent):
                 if memory.get("latest_history_topic"):
                     lines.append(f"- 历史记忆主题：{memory.get('latest_history_topic')}")
 
+            # 方案档案章节（P3b）：仅有档案股票追加；无档案股票输出与改造前逐字一致
+            pb = playbook_sections.get(w.symbol)
+            if pb:
+                lines.extend(self._render_playbook_section(pb))
+
+        # 龙虎榜章节（P3b）：无数据/取数失败时已容错为空列表,整体跳过
+        if dragon_tiger_items:
+            lines.append("\n## 龙虎榜（自选股上榜）")
+            for it in dragon_tiger_items:
+                lines.append(self._render_dragon_tiger_item(it))
+
         # 账户资金概况
         if context.portfolio.accounts:
             lines.append("\n## 账户概况")
@@ -397,6 +719,92 @@ class DailyReportAgent(BaseAgent):
 
         user_content = "\n".join(lines)
         return system_prompt, user_content
+
+    @staticmethod
+    def _render_playbook_section(pb: dict) -> list[str]:
+        """渲染单只股票的方案档案章节(prompt 输入侧,供 AI 对照点评)。"""
+        lines = ["- 方案档案："]
+
+        # ✅ 触发器逐项状态
+        triggers = pb.get("triggers") or []
+        if triggers:
+            lines.append("  - ✅ 触发器状态：")
+            for t in triggers:
+                name = t.get("name") or "提醒"
+                if t.get("triggered"):
+                    status = f"已触发({'/'.join(t.get('times') or [])})"
+                else:
+                    status = "未触发"
+                if not t.get("enabled", True):
+                    status += "（规则已停用）"
+                hint = (t.get("hint") or "").strip()
+                lines.append(f"    - {name}：{status}" + (f"｜{hint}" if hint else ""))
+        else:
+            lines.append("  - ✅ 触发器状态：未配置关联告警规则")
+
+        # 💰 持仓盈亏(流水精确口径) + 当日流水
+        pos = pb.get("position")
+        if pos:
+            qty = pos.get("quantity") or 0
+            avg_cost = float(pos.get("avg_cost") or 0.0)
+            realized = float(pos.get("realized_pnl") or 0.0)
+            floating = pos.get("floating_pnl")
+            parts = [f"{qty}股@均价{avg_cost:.2f}"]
+            if floating is not None:
+                parts.append(f"浮动{floating:+.0f}元")
+            parts.append(f"已实现{realized:+.0f}元")
+            if floating is not None:
+                parts.append(f"合计{floating + realized:+.0f}元")
+            lines.append("  - 💰 持仓盈亏（流水精确口径）：" + "，".join(parts))
+            trades_text = (pos.get("trades_text") or "").strip()
+            if trades_text:
+                label = "当日操作" if pos.get("has_today_trades") else "近期操作"
+                lines.append(f"  - 📝 {label}（流水）：{trades_text}")
+            else:
+                lines.append("  - 📝 当日操作：无流水记录")
+
+        # 📅 次日预案依据(方案摘要)
+        summary = (pb.get("summary") or "").strip()
+        if summary:
+            lines.append("  - 📅 次日预案依据（方案摘要）：")
+            for sline in summary.splitlines():
+                if sline.strip():
+                    lines.append(f"    {sline.strip()}")
+
+        # 🗓 日历提醒
+        calendar = pb.get("calendar") or []
+        if calendar:
+            lines.append("  - 🗓 日历提醒：")
+            for c in calendar:
+                seg = f"{c.get('date')} {c.get('event')}"
+                extras = [x for x in (c.get("bias"), c.get("plan")) if x]
+                if extras:
+                    seg += "（" + "；".join(extras) + "）"
+                seg += f"〔{c.get('days_until')}天后〕"
+                lines.append(f"    - {seg}")
+        return lines
+
+    @staticmethod
+    def _render_dragon_tiger_item(it: dict) -> str:
+        """渲染单条龙虎榜上榜记录(无席位明细,只渲染已有字段)。"""
+        name = it.get("name") or it.get("symbol") or ""
+        symbol = it.get("symbol") or ""
+        reason = (it.get("reason") or "").strip() or "上榜"
+        segs = [f"- {name}（{symbol}）：{reason}"]
+        close = it.get("close")
+        change_pct = it.get("change_pct")
+        if close is not None:
+            seg = f"收盘{close:.2f}"
+            if change_pct is not None:
+                seg += f" {change_pct:+.2f}%"
+            segs.append(seg)
+        net_buy = it.get("net_buy")
+        if net_buy is not None:
+            segs.append(f"龙虎榜净买{net_buy / 1e4:+.0f}万")
+        turnover_pct = it.get("turnover_pct")
+        if turnover_pct is not None:
+            segs.append(f"换手率{turnover_pct:.1f}%")
+        return "；".join(segs)
 
     def _parse_suggestions(self, content: str, watchlist: list) -> dict[str, dict]:
         """

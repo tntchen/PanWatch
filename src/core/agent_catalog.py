@@ -16,6 +16,8 @@ WORKFLOW_AGENT_NAMES: tuple[str, ...] = (
     "premarket_outlook",
     "intraday_monitor",
     "daily_report",
+    "morning_brief",
+    "tail_brief",
 )
 
 CAPABILITY_AGENT_NAMES: tuple[str, ...] = (
@@ -87,11 +89,33 @@ AGENT_SEED_SPECS: tuple[AgentSeedSpec, ...] = (
         },
     ),
     AgentSeedSpec(
+        name="morning_brief",
+        display_name="早盘简报",
+        description="开盘半小时后定势：行情/位置/三选一结论/持仓浮盈（仅对方案档案股票执行）",
+        enabled=False,
+        schedule="0 10 * * 1-5",
+        execution_mode="single",
+        kind=AGENT_KIND_WORKFLOW,
+        visible=True,
+        display_order=25,
+    ),
+    AgentSeedSpec(
+        name="tail_brief",
+        display_name="尾盘简报",
+        description="尾盘决策窗口：五选一结论+执行细节（数量与价格区间），仅对方案档案股票执行",
+        enabled=False,
+        schedule="45 14 * * 1-5",
+        execution_mode="single",
+        kind=AGENT_KIND_WORKFLOW,
+        visible=True,
+        display_order=28,
+    ),
+    AgentSeedSpec(
         name="daily_report",
         display_name="收盘复盘",
         description="每日收盘后生成复盘报告，包含市场回顾、个股复盘和次日关注",
         enabled=True,
-        schedule="30 15 * * 1-5",
+        schedule="0 18 * * 1-5",
         execution_mode="batch",
         kind=AGENT_KIND_WORKFLOW,
         visible=True,

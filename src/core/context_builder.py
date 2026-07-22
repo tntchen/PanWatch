@@ -17,9 +17,10 @@ from src.core.news_ranker import (
     rank_news_items,
     summarize_news_topics,
 )
+from src.core.playbook import load_active_playbook, summarize_playbook
 from src.models.market import MarketCode
 from src.web.database import SessionLocal
-from src.web.models import AnalysisHistory
+from src.web.models import AnalysisHistory, Stock
 from src.core.json_safe import to_jsonable
 
 logger = logging.getLogger(__name__)
@@ -423,6 +424,33 @@ class ContextBuilder:
             "last_breakout_state": last_breakout,
         }
 
+    @staticmethod
+    def _load_playbook_summary(symbol: str, market) -> str | None:
+        """⑤ 方案档案摘要注入（P3a）：读激活档案并生成紧凑摘要。
+
+        无档案 / 股票不存在 / 任何异常 → None，绝不影响主流程。
+        """
+        db = SessionLocal()
+        try:
+            mkt = market.value if isinstance(market, MarketCode) else str(market or "")
+            stock = (
+                db.query(Stock)
+                .filter(Stock.symbol == symbol, Stock.market == mkt)
+                .first()
+            )
+            if not stock:
+                return None
+            row = load_active_playbook(db, stock.id)
+            if row is None or not isinstance(row.payload, dict):
+                return None
+            summary = summarize_playbook(row.payload)
+            return summary or None
+        except Exception as e:
+            logger.debug(f"方案档案摘要注入失败 {symbol}: {e}")
+            return None
+        finally:
+            db.close()
+
     async def build_symbol_contexts(
         self,
         *,
@@ -507,6 +535,9 @@ class ContextBuilder:
                 logger.debug(f"注入 TA 深度结论失败 {symbol}: {e}")
                 ta_verdict = None
 
+            # ⑤ 方案档案摘要(P3a):无档案为 None,异常容错不影响主流程
+            playbook_summary = self._load_playbook_summary(symbol, market)
+
             payload = {
                 "symbol": symbol,
                 "name": stock_name,
@@ -525,6 +556,7 @@ class ContextBuilder:
                 "constraints": constraints,
                 "memory": snapshot_memory,
                 "data_quality": quality,
+                "playbook": playbook_summary,
             }
             symbol_contexts[symbol] = payload
             all_news_for_topic.extend(realtime_ranked[:5] + hist_ranked[:5])

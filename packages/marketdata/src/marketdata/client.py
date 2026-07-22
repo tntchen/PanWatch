@@ -38,6 +38,7 @@ INDEX_SECID: dict[str, str] = {
     "000001": "1.000001",   # 上证指数
     "399001": "0.399001",   # 深证成指
     "399006": "0.399006",   # 创业板指
+    "000688": "1.000688",   # 科创50
     "HSI": "100.HSI",       # 恒生指数
 }
 
@@ -167,6 +168,18 @@ class MarketData:
             return []
         from marketdata.vendors.kline import fetch_eastmoney_kline
         return fetch_eastmoney_kline(secid, days)
+
+    def board_quote(self, board_code: str) -> Quote | None:
+        """板块实时行情(东财,secid=90.BKxxxx)。code 非法 → None(fail-soft)。
+        不经 Engine(市场级、非 symbol 模型,同 index_klines 范式)。"""
+        from marketdata.vendors.eastmoney import fetch_eastmoney_board_quote
+        return fetch_eastmoney_board_quote(board_code)
+
+    def board_klines(self, board_code: str, *, days: int = 120) -> list:
+        """板块日K(东财,secid=90.BKxxxx)。code 非法 → [](fail-soft)。返回 list[Bar]。
+        不经 Engine(市场级、非 symbol 模型,同 index_klines 范式)。"""
+        from marketdata.vendors.kline import fetch_eastmoney_board_klines
+        return fetch_eastmoney_board_klines(board_code, days)
 
     def capital_flow(self, symbol: str, *, market: str = "CN") -> CapitalFlow | None:
         """单只股票资金流向。不在包内缓存(cache_ttl_sec=0);宿主自行缓存。"""
@@ -305,6 +318,27 @@ class MarketData:
         out: list[MarginItem] = []
         for mkt, syms in groups.items():
             req = Request(symbols=tuple(s.code for s in syms), market=mkt)
+            resp = self._margin_engine.fetch(req)
+            if resp.ok and resp.data:
+                out.extend(resp.data)
+        return out
+
+    def margin_series(self, symbols: list[str | Symbol], *, market: str | None = None,
+                      days: int = 30) -> list[MarginItem]:
+        """批量融资融券近期序列(按 symbol,每只返回最近 days 条,日期降序)。
+
+        与 margin()(最新一条快照)的区别仅在 vendor 的 series 模式;
+        返回类型一致(list[MarginItem]),消费方按 date 自行聚合/算周度趋势。
+        """
+        groups: dict[str, list[Symbol]] = {}
+        for raw in symbols:
+            sym = raw if isinstance(raw, Symbol) else Symbol.parse(raw, market)
+            groups.setdefault(sym.market.value, []).append(sym)
+
+        out: list[MarginItem] = []
+        for mkt, syms in groups.items():
+            req = Request(symbols=tuple(s.code for s in syms), market=mkt,
+                          extra=(("series", True), ("days", int(days))))
             resp = self._margin_engine.fetch(req)
             if resp.ok and resp.data:
                 out.extend(resp.data)

@@ -68,7 +68,8 @@ class DragonTigerVendor(Vendor):
 
 
 class MarginVendor(Vendor):
-    """融资融券 vendor:fetch 返回 list[MarginItem]。按 symbol(逐只取最新快照)。"""
+    """融资融券 vendor:fetch 返回 list[MarginItem]。按 symbol。
+    默认逐只取最新快照;config["series"]=True 时返回逐只完整近期序列。"""
 
     pass
 

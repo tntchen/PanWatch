@@ -11,14 +11,20 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from src.collectors.capital_flow_collector import CapitalFlowCollector
 from src.collectors.kline_collector import KlineCollector, kline_source
+from src.config import Settings
 from src.core.notifier import NotifierManager
+from src.core.notify_policy import NotifyPolicy, parse_dedupe_overrides
 from src.core.marketdata_client import md_quote_rows
 from src.models.market import MarketCode, MARKETS
 from src.web.database import SessionLocal
 from src.web.models import NotifyChannel, PriceAlertHit, PriceAlertRule, Stock
 
 logger = logging.getLogger(__name__)
+
+# A 股专属条件类型：引擎层对非 CN 市场规则整体跳过并记日志（双层门控的引擎层）。
+CN_ONLY_CONDITION_TYPES = {"turnover_rate", "capital_flow", "consecutive_close"}
 
 
 def _utc_now() -> datetime:
@@ -107,6 +113,7 @@ class PriceAlertEngine:
     def __init__(self):
         self._quote_cache: dict[str, tuple[float, dict]] = {}
         self._kline_cache: dict[str, tuple[float, dict]] = {}
+        self._closes_cache: dict[str, tuple[float, list[float]]] = {}
         self.quote_ttl_sec = 5.0
         self.kline_ttl_sec = 60.0
 
@@ -143,6 +150,43 @@ class PriceAlertEngine:
         self._kline_cache[key] = (now, summary or {})
         return summary or {}
 
+    async def _get_capital_flow(self, market: MarketCode, symbol: str):
+        """取资金流向（CapitalFlowCollector 自带 600s TTL 缓存）。失败 fail-safe 返回 None。"""
+        try:
+            return await asyncio.to_thread(
+                CapitalFlowCollector(market).get_capital_flow, symbol
+            )
+        except Exception:
+            return None
+
+    async def _get_daily_closes_cached(
+        self, market: MarketCode, symbol: str, days: int
+    ) -> list[float]:
+        """取最近 N 根日 K 收盘价（复用 KlineCollector 缓存）。
+
+        fail-safe：K 线不足 N 根、源异常时返回已有/空列表，由调用方判定不触发。
+        """
+        need = max(1, int(days or 1))
+        key = f"{market.value}:{symbol}:{need}"
+        now = time.monotonic()
+        cached = self._closes_cache.get(key)
+        if cached and now - cached[0] < self.kline_ttl_sec:
+            return list(cached[1])
+        closes: list[float] = []
+        try:
+            with kline_source("price_alert"):
+                bars = await asyncio.to_thread(
+                    KlineCollector(market).get_klines, symbol, days=need
+                )
+            for b in (bars or [])[-need:]:
+                c = _safe_float(getattr(b, "close", None))
+                if c is not None:
+                    closes.append(c)
+        except Exception:
+            closes = []
+        self._closes_cache[key] = (now, closes)
+        return closes
+
     async def _eval_condition(
         self,
         cond: dict,
@@ -170,6 +214,8 @@ class PriceAlertEngine:
             if left is None:
                 summary = await self._get_kline_summary_cached(market, symbol)
                 left = _safe_float(summary.get("volume_ratio"))
+        elif ctype in CN_ONLY_CONDITION_TYPES:
+            return await self._eval_cn_only_condition(cond, quote, market, symbol)
         else:
             return False, {"type": ctype, "error": "unsupported_type"}
 
@@ -182,6 +228,71 @@ class PriceAlertEngine:
             "matched": ok,
         }
 
+    async def _eval_cn_only_condition(
+        self,
+        cond: dict,
+        quote: dict,
+        market: MarketCode,
+        symbol: str,
+    ) -> tuple[bool, dict]:
+        """评估 A 股专属条件（turnover_rate/capital_flow/consecutive_close）。
+
+        CN-only 门控：非 CN 市场直接拒绝并记日志；数据缺失一律 fail-safe 不触发。
+        """
+        ctype = str(_json_get(cond, "type", "")).strip()
+        op = str(_json_get(cond, "op", "")).strip()
+        value = _json_get(cond, "value")
+
+        if market != MarketCode.CN:
+            logger.info(
+                "[价格提醒] 条件 %s 仅支持 A 股，跳过评估 (market=%s symbol=%s)",
+                ctype, market.value, symbol,
+            )
+            return False, {
+                "type": ctype, "op": op, "target": value,
+                "actual": None, "matched": False, "error": "cn_only",
+            }
+
+        if ctype == "turnover_rate":
+            left = _safe_float(quote.get("turnover_rate"))
+            ok = _op_eval(left, op, value)
+            return ok, {
+                "type": ctype, "op": op, "target": value,
+                "actual": left, "matched": ok,
+            }
+
+        if ctype == "capital_flow":
+            # 主力净流入（万元）：collector 原始单位为元，此处换算。
+            flow = await self._get_capital_flow(market, symbol)
+            raw = _safe_float(getattr(flow, "main_net_inflow", None)) if flow else None
+            left = raw / 10000.0 if raw is not None else None
+            ok = _op_eval(left, op, value)
+            return ok, {
+                "type": ctype, "op": op, "target": value,
+                "actual": left, "matched": ok,
+                "error": None if left is not None else "no_capital_flow",
+            }
+
+        # consecutive_close：最近 N 根日 K 收盘价全部满足 op/value 才命中。
+        try:
+            days = int(_json_get(cond, "days", 0) or 0)
+        except Exception:
+            days = 0
+        closes: list[float] = []
+        if days >= 1:
+            closes = await self._get_daily_closes_cached(market, symbol, days)
+        window = closes[-days:] if days >= 1 else []
+        if days < 1 or len(window) < days:
+            return False, {
+                "type": ctype, "op": op, "target": value, "days": days,
+                "actual": window, "matched": False, "error": "insufficient_kline",
+            }
+        ok = all(_op_eval(c, op, value) for c in window)
+        return ok, {
+            "type": ctype, "op": op, "target": value, "days": days,
+            "actual": window, "matched": ok,
+        }
+
     async def eval_rule(self, rule: PriceAlertRule, quote: dict) -> RuleEvalResult:
         cond_group = rule.condition_group or {}
         op = str(cond_group.get("op", "and")).lower()
@@ -191,6 +302,29 @@ class PriceAlertEngine:
 
         market = _to_market(rule.stock.market)
         symbol = rule.stock.symbol
+
+        # CN-only 规则级门控：非 CN 股票含 A 股专属条件的规则整体跳过并记日志。
+        if market != MarketCode.CN:
+            cn_only_hit = any(
+                isinstance(c, dict)
+                and str(_json_get(c, "type", "")).strip() in CN_ONLY_CONDITION_TYPES
+                for c in items
+            )
+            if cn_only_hit:
+                logger.info(
+                    "[价格提醒] 规则 %s 含 A 股专属条件，非 CN 市场规则整体跳过 (market=%s symbol=%s)",
+                    rule.id, market.value, symbol,
+                )
+                return RuleEvalResult(
+                    matched=False,
+                    hits=[],
+                    snapshot={
+                        "symbol": symbol,
+                        "market": market.value,
+                        "error": "cn_only_condition",
+                    },
+                )
+
         results: list[dict] = []
         bools: list[bool] = []
         for cond in items:
@@ -275,9 +409,62 @@ class PriceAlertEngine:
             .all()
         )
 
+    def _build_notify_policy(self, db: Session | None) -> NotifyPolicy:
+        """构建统一 NotifyPolicy（静默时段等），Settings 默认值 + app_settings 覆盖。"""
+        settings = Settings()
+        quiet_hours = settings.notify_quiet_hours or ""
+        retry_attempts = settings.notify_retry_attempts
+        retry_backoff = settings.notify_retry_backoff_seconds
+        overrides_raw = settings.notify_dedupe_ttl_overrides or ""
+        try:
+            from src.web.models import AppSettings
+
+            def _get(key: str) -> str:
+                row = db.query(AppSettings).filter(AppSettings.key == key).first()
+                return row.value if row and row.value else ""
+
+            quiet_hours = _get("notify_quiet_hours") or quiet_hours
+            ra = _get("notify_retry_attempts")
+            if ra:
+                retry_attempts = int(ra)
+            rb = _get("notify_retry_backoff_seconds")
+            if rb:
+                retry_backoff = float(rb)
+            overrides_raw = _get("notify_dedupe_ttl_overrides") or overrides_raw
+        except Exception:
+            pass
+        try:
+            retry_attempts = int(retry_attempts)
+        except Exception:
+            retry_attempts = 0
+        try:
+            retry_backoff = float(retry_backoff)
+        except Exception:
+            retry_backoff = 0.0
+        return NotifyPolicy(
+            timezone=settings.app_timezone or "UTC",
+            quiet_hours=quiet_hours,
+            retry_attempts=retry_attempts,
+            retry_backoff_seconds=retry_backoff,
+            dedupe_ttl_overrides=parse_dedupe_overrides(overrides_raw),
+        )
+
+    def _get_playbook_hint(self, db: Session, rule: PriceAlertRule) -> str | None:
+        """命中时读取关联方案的触发提示文案（无关联/无匹配/异常均返回 None）。"""
+        pid = getattr(rule, "playbook_id", None)
+        if not pid:
+            return None
+        try:
+            from src.core.playbook import get_trigger_hint
+
+            return get_trigger_hint(db, int(pid), rule.name or "")
+        except Exception as e:
+            logger.debug("[价格提醒] 读取方案提示失败 rule=%s: %s", rule.id, e)
+            return None
+
     async def _send_notify(self, db: Session, rule: PriceAlertRule, snapshot: dict) -> tuple[bool, str]:
         channels = self._resolve_channels(db, rule)
-        notifier = NotifierManager()
+        notifier = NotifierManager(policy=self._build_notify_policy(db))
         for ch in channels:
             notifier.add_channel(ch.type, ch.config or {})
 
@@ -301,6 +488,9 @@ class PriceAlertEngine:
         if hit_lines:
             lines.append("命中条件:")
             lines.extend(hit_lines[:4])
+        hint = self._get_playbook_hint(db, rule)
+        if hint:
+            lines.append(f"方案提示: {hint}")
         content = "\n".join(lines)
 
         try:

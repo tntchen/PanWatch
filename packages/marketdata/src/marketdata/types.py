@@ -58,6 +58,7 @@ class Bar:
     high: float
     low: float
     volume: float = 0.0
+    turnover: float | None = None  # 成交额(元);目前仅东财K线填充,其余源为 None(不伪造)
 
 
 @dataclass

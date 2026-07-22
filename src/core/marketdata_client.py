@@ -145,6 +145,30 @@ def md_news_by_keyword(keyword: str) -> list:
     return [_article_to_newsitem(a) for a in arts]
 
 
+def md_dragon_tiger(date: str | None = None, market: str = "CN") -> list[dict]:
+    """龙虎榜(市场级,单日快照),返回 list[dict](字段同 DragonTigerItem)。
+
+    date 为 YYYY-MM-DD;包内不猜测"今天",date 为 None 时返回 []。
+    同步函数;async 调用方用 `await asyncio.to_thread(md_dragon_tiger, ...)`。
+    """
+    items = get_market_data().dragon_tiger(date=date, market=market)
+    return [
+        {
+            "trade_date": it.trade_date,
+            "symbol": it.symbol,
+            "name": it.name,
+            "reason": it.reason,
+            "close": it.close,
+            "change_pct": it.change_pct,
+            "net_buy": it.net_buy,
+            "buy_amt": it.buy_amt,
+            "sell_amt": it.sell_amt,
+            "turnover_pct": it.turnover_pct,
+        }
+        for it in items
+    ]
+
+
 def md_stock_data(symbols: list[str], market: str) -> list:
     """返回 list[StockData](旧 AkshareCollector.get_stock_data 同形)。同步。"""
     from src.models.market import MarketCode, StockData
