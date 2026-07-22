@@ -44,6 +44,6 @@
 - Playwright: in Docker, browsers install under `DATA_DIR/playwright` automatically; local dev uses system install.
 
 ## 二次开发协作约定（项目所有者要求，2026-07-21 起生效）
-- 本项目为中等复杂度二次开发（fork 自 TNT-Likely/PanWatch），采用**阶段门禁制**：任何开发任务先出/更新计划文档（`doc/` 目录），经所有者逐条确认决策点后才能动代码；每个阶段完成后提交变更清单供审计，确认后才进入下一阶段。
+- 本项目为中等复杂度二次开发（fork 自 TNT-Likely/PanWatch），采用**阶段门禁制**：任何开发任务先出/更新计划文档（`docs/` 目录），经所有者逐条确认决策点后才能动代码；每个阶段完成后提交变更清单供审计，确认后才进入下一阶段。
 - 发现计划外的新问题或新选项时，暂停并回报，不自行扩大改动范围。
-- 项目解读文档与融合计划索引见 `doc/README.md` 与 `doc/12-融合计划-东芯方案与持仓交易.md`。
+- 项目解读文档与融合计划索引见 `docs/README.md` 与 `docs/12-融合计划-东芯方案与持仓交易.md`。

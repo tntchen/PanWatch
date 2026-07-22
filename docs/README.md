@@ -45,4 +45,4 @@
 - DB 时间一律 UTC-naive，调度用 `Settings().app_timezone`。
 - SQLite 写锁敏感：遵循 no_autoflush、分批 commit 的既有模式。
 - 红涨绿跌配色（前端）、`llm_provider` 必须写 `"openrouter"`（TradingAgents）等具体坑见各分文档。
-- 仓库原有的 `docs/` 目录只有截图和打赏图；本 `doc/` 目录才是解读文档。
+- 仓库原有的 `docs/` 目录只有截图和打赏图；本 `docs/` 目录才是解读文档。
