@@ -12,6 +12,10 @@ export interface AIService {
   base_url: string
   api_key: string
   models: AIModel[]
+  /** 属主租户（多租户；单租户/旧后端可能缺省） */
+  tenant_id?: number
+  /** 管理员托管服务：密钥不出网（api_key 恒为空串），非管理员只读 */
+  is_managed?: boolean
 }
 
 export interface NotifyChannel {
@@ -21,6 +25,12 @@ export interface NotifyChannel {
   config: Record<string, string>
   enabled: boolean
   is_default: boolean
+  /** 属主租户（多租户；单租户/旧后端可能缺省） */
+  tenant_id?: number
+  /** 管理员共享给配额共享租户的渠道 */
+  is_shared?: boolean
+  /** 管理员托管渠道：config 恒为 {}，非管理员只读（可测试） */
+  is_managed?: boolean
 }
 
 export interface SourceHealth {

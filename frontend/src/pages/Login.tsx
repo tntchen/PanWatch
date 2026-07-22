@@ -51,7 +51,7 @@ export default function LoginPage() {
 
       // 账号切换检测：先与上次身份比对（不一致会清掉旧业务键与旧 token），再写入新凭证
       if (data.user) {
-        reconcileAuthIdentity({ user_id: data.user.id, tenant_id: data.user.tenant_id })
+        reconcileAuthIdentity({ user_id: data.user.id, tenant_id: data.user.tenant_id, username: data.user.username })
       }
       // 保存 token（新契约登录返回 {token, user}；expires_at 可选）
       localStorage.setItem('token', data.token)
@@ -64,7 +64,7 @@ export default function LoginPage() {
       if (!data.user) {
         try {
           const me = await authApi.me()
-          reconcileAuthIdentity({ user_id: me.id, tenant_id: me.tenant_id })
+          reconcileAuthIdentity({ user_id: me.id, tenant_id: me.tenant_id, username: me.username })
         } catch {
           // 忽略：App 启动后 AccountMenu 会再次拉取 /auth/me
         }

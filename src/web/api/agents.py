@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
 from src.web.database import get_db
+from src.web.api.auth import require_admin  # MT-P4：实例级模板写操作仅管理员（docs/27 行26）
 from src.web.models import AgentConfig, AgentRun, LogEntry
 from src.core.schedule_parser import preview_schedule
 from src.core.schedule_parser import count_runs_within
@@ -289,7 +290,10 @@ def list_capabilities(db: Session = Depends(get_db)):
 
 @router.put("/{agent_name}", response_model=AgentConfigResponse)
 def update_agent(
-    agent_name: str, update: AgentConfigUpdate, db: Session = Depends(get_db)
+    agent_name: str,
+    update: AgentConfigUpdate,
+    db: Session = Depends(get_db),
+    _: object = Depends(require_admin),
 ):
     agent = db.query(AgentConfig).filter(AgentConfig.name == agent_name).first()
     if not agent:
@@ -353,7 +357,11 @@ def preview_agent_schedule(
 
 
 @router.delete("/{agent_name}")
-def delete_agent(agent_name: str, db: Session = Depends(get_db)):
+def delete_agent(
+    agent_name: str,
+    db: Session = Depends(get_db),
+    _: object = Depends(require_admin),
+):
     """删除 Agent 配置"""
     agent = db.query(AgentConfig).filter(AgentConfig.name == agent_name).first()
     if not agent:

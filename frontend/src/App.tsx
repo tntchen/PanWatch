@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef } from 'react'
 import { Routes, Route, NavLink, useLocation, Navigate } from 'react-router-dom'
-import { TrendingUp, Bot, ScrollText, Settings, List, Database, Clock, LayoutDashboard, Github, BellRing, Sparkles, Activity } from 'lucide-react'
+import { TrendingUp, Bot, ScrollText, Settings, List, Database, Clock, LayoutDashboard, Github, BellRing, Sparkles, Activity, ShieldAlert } from 'lucide-react'
 import { useTheme } from '@/hooks/use-theme'
+import { useAuthUser } from '@/hooks/use-auth-user'
 import { appApi, fetchAPI, isAuthenticated } from '@panwatch/api'
 import DashboardPage from '@/pages/Dashboard'
 import OpportunitiesPage from '@/pages/Opportunities'
@@ -65,6 +66,35 @@ function RequireAuth({ children }: { children: React.ReactNode }) {
 
   if (authState === 'unauthenticated') {
     return <Navigate to="/login" state={{ from: location }} replace />
+  }
+
+  return <>{children}</>
+}
+
+// 管理员路由守卫（docs/27 权限矩阵：用户管理仅 admin；导航入口已在 AccountMenu 按角色隐藏）
+function RequireAdmin({ children }: { children: React.ReactNode }) {
+  const authUser = useAuthUser()
+
+  // /auth/me 加载中（RequireAuth 已保证已登录，null 即尚未返回）
+  if (!authUser) {
+    return (
+      <div className="min-h-[50vh] flex items-center justify-center">
+        <span className="w-6 h-6 border-2 border-primary/30 border-t-primary rounded-full animate-spin" />
+      </div>
+    )
+  }
+
+  if (authUser.role !== 'admin') {
+    return (
+      <div className="min-h-[50vh] flex flex-col items-center justify-center gap-2.5 text-center">
+        <ShieldAlert className="w-8 h-8 text-muted-foreground" />
+        <div className="text-[15px] font-medium text-foreground">无访问权限</div>
+        <div className="text-[13px] text-muted-foreground">该页面仅管理员可见</div>
+        <NavLink to="/" className="text-[13px] text-primary hover:underline">
+          返回首页
+        </NavLink>
+      </div>
+    )
   }
 
   return <>{children}</>
@@ -265,7 +295,7 @@ function App() {
           <Route path="/alerts" element={<PriceAlertsPage />} />
           <Route path="/datasources" element={<DataSourcesPage />} />
           <Route path="/settings" element={<SettingsPage />} />
-          <Route path="/users" element={<UsersPage />} />
+          <Route path="/users" element={<RequireAdmin><UsersPage /></RequireAdmin>} />
           <Route path="/analysis/:symbol/:date" element={<AnalysisDetailPage />} />
         </Routes>
       </main>

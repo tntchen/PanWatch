@@ -101,6 +101,12 @@ export interface NotifyChannelItem {
   name: string
   type: string
   is_default: boolean
+  /** 属主租户（多租户；单租户/旧后端可能缺省） */
+  tenant_id?: number
+  /** 管理员共享给配额共享租户的渠道 */
+  is_shared?: boolean
+  /** 管理员托管渠道 */
+  is_managed?: boolean
 }
 
 export interface PaperTradingNotifySettings {

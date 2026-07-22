@@ -25,7 +25,7 @@ export function refreshAuthUser(): Promise<AuthMe | null> {
     inflight = authApi.me()
       .then(me => {
         cache = me
-        reconcileAuthIdentity({ user_id: me.id, tenant_id: me.tenant_id })
+        reconcileAuthIdentity({ user_id: me.id, tenant_id: me.tenant_id, username: me.username })
         emit()
         return me
       })

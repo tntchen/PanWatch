@@ -583,3 +583,26 @@ def test_ta_bridge_signal_tenant_attribution(mt_db, monkeypatch):
     row = db.query(M.StrategySignalRun).filter_by(stock_symbol="000001").one()
     assert row.tenant_id == 1
     db.close()
+
+
+def test_build_ai_client_env_fallback_admin_tenant_only(monkeypatch):
+    """F6（docs/23 P10，docs/26-J11 裁决）：env 凭证回退仅限管理员租户。
+
+    普通租户可见集为空时不得回退 env（否则等于全员共享管理员 key，违背 T13）。
+    """
+    import server
+    from src.web.tenant_context import DEFAULT_TENANT_ID
+
+    monkeypatch.setenv("AI_API_KEY", "env-secret-key")  # Settings 读取兜底
+    # 管理员租户（含单租户直通，tenant_id 恒为 1）：允许 env 回退
+    c_admin = server._build_ai_client(None, None, "", tenant_id=DEFAULT_TENANT_ID)
+    assert c_admin.api_key != "panwatch-unconfigured"
+    # 普通租户：不回退 env，返回未配置占位客户端
+    c_user = server._build_ai_client(None, None, "", tenant_id=2)
+    assert c_user.api_key == "panwatch-unconfigured"
+    assert c_user.base_url == ""
+    # 显式解析到模型时不受影响
+    svc = SimpleNamespace(base_url="https://x", api_key="k", name="s")
+    mdl = SimpleNamespace(model="m")
+    c_cfg = server._build_ai_client(mdl, svc, "", tenant_id=2)
+    assert c_cfg.api_key == "k"

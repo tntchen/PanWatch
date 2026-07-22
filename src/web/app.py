@@ -1,4 +1,5 @@
 import os
+import time
 
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -39,7 +40,8 @@ from src.web.api import insights
 from src.web.api.auth import get_current_user
 from src.web.api.settings import get_app_version
 from src.web.response import ResponseWrapperMiddleware
-from src.web.tenant_context import TenantContextMiddleware
+from src.web.tenant_context import TenantContextMiddleware, single_tenant_mode
+from src.core.report_link import verify_report_signature
 
 app = FastAPI(
     title="PanWatch API",
@@ -203,17 +205,18 @@ async def version():
 
 # ---------------------------------------------------------------------------
 # 研究报告下载（P4）：必须避开 /api/ 前缀——ResponseWrapper 会整体缓冲大响应。
-# 鉴权与 server.py 的静态文件服务保持一致（不强制登录）。
+# 鉴权（MT-P4，docs/25 §6）：HMAC 签名 URL，不加登录态——
+#   GET /reports/{tenant_id}/{filename}?exp=<unix_ts>&sig=<hex>
+#   sig = HMAC_SHA256(key=jwt_secret, msg=f"{tenant_id}|{filename}|{exp}")
+# exp 过期 → 410；sig 不匹配 → 403。单租户直通（PANWATCH_SINGLE_TENANT=1）下
+# 旧形态无签名 /reports/{filename} 按 tenant=1 放行（存量通知外链不断）；
+# 多租户模式下旧无签名链接一次性失效（不设兼容期，docs/25 §6.2 已裁决）。
 # ---------------------------------------------------------------------------
 REPORTS_DIR = os.path.join(os.path.dirname(DB_PATH), "reports")
 
 
-@app.get("/reports/{filename}")
-async def download_report(filename: str):
-    """从 data/reports/ 下载研究报告附件（如 docx）。
-
-    安全：仅允许 basename，拒绝含 ".." / "/" / "\\" 的输入，防路径穿越。
-    """
+def _serve_report_file(filename: str) -> FileResponse:
+    """从 data/reports/ 取报告文件（防穿越：basename + realpath 双保险）。"""
     if (
         not filename
         or filename in (".", "..")
@@ -230,3 +233,31 @@ async def download_report(filename: str):
     if not os.path.isfile(file_path):
         raise HTTPException(status_code=404, detail="文件不存在")
     return FileResponse(file_path, filename=filename)
+
+
+@app.get("/reports/{tenant_id}/{filename}")
+async def download_report_signed(
+    tenant_id: int, filename: str, exp: str = "", sig: str = ""
+):
+    """签名下载（docs/25 §6）：先验签（失败 403），再验期（过期 410）。
+
+    签名绑定 tenant_id + filename + exp，跨租户挪用他租户签名即 sig 不匹配。
+    有效期 7 天；过期后用户登录系统从报告页重取新签名链接。
+    """
+    if not verify_report_signature(tenant_id, filename, exp, sig):
+        raise HTTPException(status_code=403, detail="签名无效或链接已被篡改")
+    if int(exp) < int(time.time()):
+        raise HTTPException(status_code=410, detail="签名链接已过期，请重新获取")
+    return _serve_report_file(filename)
+
+
+@app.get("/reports/{filename}")
+async def download_report(filename: str):
+    """旧形态无签名下载（单租户直通专用）。
+
+    单租户模式（PANWATCH_SINGLE_TENANT=1）：按 tenant=1 放行，行为等价现状；
+    多租户模式：403，必须使用 /reports/{tenant_id}/{filename} 签名链接。
+    """
+    if not single_tenant_mode():
+        raise HTTPException(status_code=403, detail="报告下载需使用带签名的链接")
+    return _serve_report_file(filename)

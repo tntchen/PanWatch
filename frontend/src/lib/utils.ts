@@ -1,15 +1,16 @@
 import { useState, useEffect } from 'react'
+import { scopedGet, scopedSet } from '@panwatch/api'
 export { cn } from '@panwatch/base-ui'
 
 /**
- * 持久化到 localStorage 的 useState
- * @param key localStorage 键名
+ * 持久化到 localStorage 的 useState（MT-P4 起按用户隔离，见 @panwatch/api storage.ts）
+ * @param key localStorage 键名（用户作用域内的逻辑键，非完整键）
  * @param defaultValue 默认值
  */
 export function useLocalStorage<T>(key: string, defaultValue: T): [T, (value: T | ((prev: T) => T)) => void] {
   const [value, setValue] = useState<T>(() => {
     try {
-      const saved = localStorage.getItem(key)
+      const saved = scopedGet(key)
       if (saved !== null) {
         return JSON.parse(saved)
       }
@@ -21,7 +22,7 @@ export function useLocalStorage<T>(key: string, defaultValue: T): [T, (value: T 
 
   useEffect(() => {
     try {
-      localStorage.setItem(key, JSON.stringify(value))
+      scopedSet(key, JSON.stringify(value))
     } catch {
       // ignore
     }

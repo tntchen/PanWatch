@@ -1,14 +1,16 @@
 import { useState, useEffect } from 'react'
+import { scopedGet, scopedSet } from '@panwatch/api'
 
 /** 用户选择的主题模式(system = 跟随系统)。 */
 export type ThemeMode = 'light' | 'dark' | 'system'
 /** 实际生效的主题(system 解析后的结果)。 */
 export type Theme = 'light' | 'dark'
 
+/** 主题偏好按用户隔离（MT-P4 storage.ts）；未登录时落 anon 作用域，登录后迁移 */
 const STORAGE_KEY = 'panwatch-theme'
 
 function readMode(): ThemeMode {
-  const stored = localStorage.getItem(STORAGE_KEY)
+  const stored = scopedGet(STORAGE_KEY)
   if (stored === 'light' || stored === 'dark' || stored === 'system') return stored
   return 'system'
 }
@@ -34,7 +36,7 @@ export function useTheme() {
     const root = document.documentElement
     root.classList.remove('light', 'dark')
     root.classList.add(theme)
-    localStorage.setItem(STORAGE_KEY, mode)
+    scopedSet(STORAGE_KEY, mode)
   }, [theme, mode])
 
   // 兼容旧调用:在亮/暗间切换(会把模式落为显式 light/dark)

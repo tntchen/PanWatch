@@ -2,6 +2,9 @@ import { useState, useEffect, useRef } from 'react'
 import { Check, Eye, EyeOff, Plus, Pencil, Trash2, Star, Send, Cpu, Play, Download, Upload, FileJson, BarChart3, User, Radar } from 'lucide-react'
 import { fetchAPI, type AIService, type AIModel, type NotifyChannel } from '@panwatch/api'
 import { useAvatar, saveAvatar, fileToAvatarDataUrl } from '@/hooks/use-avatar'
+import { useAuthUser } from '@/hooks/use-auth-user'
+import { ManagedBadge } from '@/components/ManagedBadge'
+import { tenantViewCtx, isManagedItem, canCreateAiService } from '@/lib/settings-scope'
 import { Input } from '@panwatch/base-ui/components/ui/input'
 import { Label } from '@panwatch/base-ui/components/ui/label'
 import { Button } from '@panwatch/base-ui/components/ui/button'
@@ -183,6 +186,10 @@ export default function SettingsPage() {
   const avatar = useAvatar()
   const avatarFileRef = useRef<HTMLInputElement | null>(null)
   const [avatarSaving, setAvatarSaving] = useState(false)
+
+  // 多租户两态视图：admin/单租户=现状全量 UI；配额共享租户托管项只读
+  const me = useAuthUser()
+  const viewCtx = tenantViewCtx(me)
 
   // Templates (config pack)
   const [importMode, setImportMode] = useState<'merge' | 'replace'>('merge')
@@ -743,23 +750,31 @@ export default function SettingsPage() {
               <h3 className="text-[12px] md:text-[13px] font-semibold text-foreground">AI 服务商 & 模型</h3>
               <p className="text-[11px] text-muted-foreground mt-1">连接你的 AI 服务并设置默认模型</p>
             </div>
-            <Button size="sm" className="h-8" onClick={() => openServiceDialog()}>
-              <Plus className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">添加服务商</span>
-            </Button>
+            {canCreateAiService(viewCtx) && (
+              <Button size="sm" className="h-8" onClick={() => openServiceDialog()}>
+                <Plus className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">添加服务商</span>
+              </Button>
+            )}
           </div>
           {services.length === 0 ? (
-            <p className="text-[13px] text-muted-foreground text-center py-6">暂无 AI 服务商，点击"添加服务商"创建</p>
+            <p className="text-[13px] text-muted-foreground text-center py-6">
+              {canCreateAiService(viewCtx) ? '暂无 AI 服务商，点击"添加服务商"创建' : '暂无可用 AI 服务商，请联系管理员配置'}
+            </p>
           ) : (
             <div className="space-y-4">
-              {services.map(svc => (
+              {services.map(svc => {
+                const managed = isManagedItem(svc, viewCtx)
+                return (
                 <div key={svc.id} className="rounded-xl bg-accent/30 overflow-hidden">
                   {/* Service header */}
                   <div className="flex items-center justify-between p-3.5">
                     <div className="min-w-0">
                       <span className="text-[13px] font-medium text-foreground">{svc.name}</span>
+                      {managed && <ManagedBadge className="ml-2" />}
                       <p className="text-[11px] text-muted-foreground mt-0.5 truncate font-mono">{svc.base_url}</p>
                     </div>
+                    {!managed && (
                     <div className="flex items-center gap-1 flex-shrink-0">
                       <Button size="sm" variant="ghost" className="h-7 text-[11px]" onClick={() => openModelDialog(svc.id)}>
                         <Plus className="w-3 h-3" /> 模型
@@ -779,6 +794,7 @@ export default function SettingsPage() {
                         <Trash2 className="w-3.5 h-3.5" />
                       </Button>
                     </div>
+                    )}
                   </div>
                   {/* Models under this service */}
                   {svc.models.length > 0 && (
@@ -804,24 +820,29 @@ export default function SettingsPage() {
                                 <Play className="w-3 h-3" />
                               )}
                             </Button>
-                            {!m.is_default && (
+                            {!managed && !m.is_default && (
                               <Button variant="ghost" size="icon" className="h-6 w-6" onClick={() => setDefaultModel(m.id)} title="设为默认">
                                 <Star className="w-3 h-3" />
                               </Button>
                             )}
+                            {!managed && (
+                              <>
                             <Button variant="ghost" size="icon" className="h-6 w-6" onClick={() => openModelDialog(svc.id, m)}>
                               <Pencil className="w-3 h-3" />
                             </Button>
                             <Button variant="ghost" size="icon" className="h-6 w-6 hover:text-destructive" onClick={() => deleteModel(m.id)}>
                               <Trash2 className="w-3 h-3" />
                             </Button>
+                              </>
+                            )}
                           </div>
                         </div>
                       ))}
                     </div>
                   )}
                 </div>
-              ))}
+                )
+              })}
             </div>
           )}
         </section>
@@ -842,12 +863,15 @@ export default function SettingsPage() {
             <p className="text-[13px] text-muted-foreground text-center py-6">暂无通知渠道，点击"添加"创建</p>
           ) : (
             <div className="space-y-3">
-              {channels.map(ch => (
+              {channels.map(ch => {
+                const managed = isManagedItem(ch, viewCtx)
+                return (
                 <div key={ch.id} className="flex items-center justify-between p-3.5 rounded-xl bg-accent/30 hover:bg-accent/50 transition-colors">
                   <div className="flex items-center gap-3 min-w-0">
                     {ch.is_default && <Star className="w-3.5 h-3.5 text-amber-500 flex-shrink-0" />}
                     <div className="min-w-0">
                       <span className="text-[13px] font-medium text-foreground">{ch.name}</span>
+                      {managed && <ManagedBadge className="ml-2" />}
                       <p className="text-[11px] text-muted-foreground mt-0.5">{CHANNEL_TYPE_FIELDS[ch.type]?.label || ch.type}</p>
                     </div>
                   </div>
@@ -864,6 +888,10 @@ export default function SettingsPage() {
                         <Send className="w-3.5 h-3.5" />
                       )}
                     </Button>
+                    {managed ? (
+                      <span className="text-[11px] text-muted-foreground px-1">{ch.enabled ? '已启用' : '已停用'}</span>
+                    ) : (
+                      <>
                     {!ch.is_default && (
                       <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => setDefaultChannel(ch.id)} title="设为默认">
                         <Star className="w-3.5 h-3.5" />
@@ -876,9 +904,12 @@ export default function SettingsPage() {
                     <Button variant="ghost" size="icon" className="h-7 w-7 hover:text-destructive" onClick={() => deleteChannel(ch.id)}>
                       <Trash2 className="w-3.5 h-3.5" />
                     </Button>
+                      </>
+                    )}
                   </div>
                 </div>
-              ))}
+                )
+              })}
             </div>
           )}
         </section>

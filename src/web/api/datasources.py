@@ -7,6 +7,7 @@ from pydantic import BaseModel
 
 from src.web.database import get_db
 from src.web.models import DataSource
+from src.web.api.auth import require_admin  # MT-P4：数据源写操作仅管理员（docs/27 §行31）
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +138,9 @@ def get_datasource_types():
 
 
 @router.post("/reset-to-seed")
-def reset_datasources_to_seed(db: Session = Depends(get_db)):
+def reset_datasources_to_seed(
+    db: Session = Depends(get_db), _: object = Depends(require_admin)
+):
     """数据源表温和对账:补齐缺失的预置默认 + 删除孤儿行,保留用户有效自定义/凭证。"""
     from server import reconcile_data_sources
 
@@ -156,7 +159,11 @@ def get_datasource(source_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("")
-def create_datasource(data: DataSourceCreate, db: Session = Depends(get_db)):
+def create_datasource(
+    data: DataSourceCreate,
+    db: Session = Depends(get_db),
+    _: object = Depends(require_admin),
+):
     """创建数据源"""
     source = DataSource(
         name=data.name,
@@ -177,7 +184,10 @@ def create_datasource(data: DataSourceCreate, db: Session = Depends(get_db)):
 
 @router.put("/{source_id}")
 def update_datasource(
-    source_id: int, data: DataSourceUpdate, db: Session = Depends(get_db)
+    source_id: int,
+    data: DataSourceUpdate,
+    db: Session = Depends(get_db),
+    _: object = Depends(require_admin),
 ):
     """更新数据源"""
     source = db.query(DataSource).filter(DataSource.id == source_id).first()
@@ -194,7 +204,11 @@ def update_datasource(
 
 
 @router.delete("/{source_id}")
-def delete_datasource(source_id: int, db: Session = Depends(get_db)):
+def delete_datasource(
+    source_id: int,
+    db: Session = Depends(get_db),
+    _: object = Depends(require_admin),
+):
     """删除数据源"""
     source = db.query(DataSource).filter(DataSource.id == source_id).first()
     if not source:

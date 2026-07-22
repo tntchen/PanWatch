@@ -33,6 +33,11 @@ def _client():
             s.close()
 
     app.dependency_overrides[get_db] = _db
+    # MT-P4：写端点加 require_admin（docs/27），此处覆盖依赖直通——
+    # 本文件测的是数据源对账逻辑本身，管理员校验由 test_auth_mt 系列覆盖。
+    from src.web.api.auth import require_admin
+
+    app.dependency_overrides[require_admin] = lambda: None
     return TestClient(app), Session
 
 

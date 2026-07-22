@@ -20,6 +20,8 @@ import {
 } from 'lucide-react'
 import {
   tradingAgentsApi,
+  scopedGet,
+  scopedSet,
   type DeepAnalysisResult,
   type HistoryComparisonResponse,
 } from '@panwatch/api'
@@ -44,7 +46,7 @@ const SECTION_ICON: Record<string, LucideIcon> = {
   risk: ShieldAlert,
 }
 
-/** 二级目录显示开关的 localStorage 键(记住用户选择) */
+/** 二级目录显示开关的 localStorage 键(记住用户选择, MT-P4 起按用户隔离) */
 const TOC_SUB_KEY = 'panwatch_toc_show_sub'
 
 /** 从代码粗略推断市场:6 位数字=A股, 5 位数字=港股, 其余=美股 */
@@ -110,7 +112,7 @@ export default function AnalysisDetailPage() {
   const [tocOpen, setTocOpen] = useState(false)
   const [showSub, setShowSub] = useState(() => {
     try {
-      return localStorage.getItem(TOC_SUB_KEY) !== '0'
+      return scopedGet(TOC_SUB_KEY) !== '0'
     } catch {
       return true
     }
@@ -146,7 +148,7 @@ export default function AnalysisDetailPage() {
   // 记住二级目录开关
   useEffect(() => {
     try {
-      localStorage.setItem(TOC_SUB_KEY, showSub ? '1' : '0')
+      scopedSet(TOC_SUB_KEY, showSub ? '1' : '0')
     } catch {
       /* ignore */
     }

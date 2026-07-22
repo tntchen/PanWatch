@@ -17,6 +17,9 @@ import { useToast } from '@panwatch/base-ui/components/ui/toast'
 import { HoverPopover } from '@panwatch/base-ui/components/ui/hover-popover'
 import {
   tradingAgentsApi,
+  scopedGet,
+  scopedSet,
+  scopedRemove,
   type BudgetInfo,
   type DeepAnalysisResult,
   type ProgressResponse,
@@ -43,19 +46,19 @@ const DECISION_COLOR: Record<string, string> = {
 
 const POLL_INTERVAL_MS = 2000
 
-/** localStorage 里记录某只股票最近一次触发的 trace_id;关闭重开弹窗时恢复 polling */
+/** localStorage 里记录某只股票最近一次触发的 trace_id;关闭重开弹窗时恢复 polling（MT-P4 起按用户隔离） */
 const STORAGE_KEY_PREFIX = 'panwatch:tradingagents:running:'
 /** trace_id 持续多久后认为可能已不再运行(避免显示过期 trace 的 idle) */
 const TRACE_MAX_AGE_MS = 20 * 60 * 1000  // 20 分钟
 
 function loadRunningTrace(stockSymbol: string): string | null {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY_PREFIX + stockSymbol)
+    const raw = scopedGet(STORAGE_KEY_PREFIX + stockSymbol)
     if (!raw) return null
     const parsed = JSON.parse(raw) as { traceId: string; startedAt: number }
     if (!parsed.traceId || !parsed.startedAt) return null
     if (Date.now() - parsed.startedAt > TRACE_MAX_AGE_MS) {
-      localStorage.removeItem(STORAGE_KEY_PREFIX + stockSymbol)
+      scopedRemove(STORAGE_KEY_PREFIX + stockSymbol)
       return null
     }
     return parsed.traceId
@@ -66,7 +69,7 @@ function loadRunningTrace(stockSymbol: string): string | null {
 
 function saveRunningTrace(stockSymbol: string, traceId: string): void {
   try {
-    localStorage.setItem(
+    scopedSet(
       STORAGE_KEY_PREFIX + stockSymbol,
       JSON.stringify({ traceId, startedAt: Date.now() }),
     )
@@ -77,7 +80,7 @@ function saveRunningTrace(stockSymbol: string, traceId: string): void {
 
 function clearRunningTrace(stockSymbol: string): void {
   try {
-    localStorage.removeItem(STORAGE_KEY_PREFIX + stockSymbol)
+    scopedRemove(STORAGE_KEY_PREFIX + stockSymbol)
   } catch {
     /* ignore */
   }

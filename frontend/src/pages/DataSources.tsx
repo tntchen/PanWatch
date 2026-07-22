@@ -8,6 +8,7 @@ import { Switch } from '@panwatch/base-ui/components/ui/switch'
 import { Badge } from '@panwatch/base-ui/components/ui/badge'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@panwatch/base-ui/components/ui/dialog'
 import { useToast } from '@panwatch/base-ui/components/ui/toast'
+import { useAuthUser } from '../hooks/use-auth-user'
 
 interface TestLogItem {
   timestamp: string
@@ -99,6 +100,9 @@ const emptyForm: DataSourceForm = {
 }
 
 export default function DataSourcesPage() {
+  const me = useAuthUser()
+  // MT-P4：数据源增删改/优先级仅管理员（docs/27）；me 为空（单租户/免密）按管理员处理
+  const isAdmin = !me || me.role === 'admin'
   const [sources, setSources] = useState<DataSource[]>([])
   const [loading, setLoading] = useState(true)
   const [dialogOpen, setDialogOpen] = useState(false)
@@ -304,12 +308,16 @@ export default function DataSourcesPage() {
                     </div>
                   </div>
                   <div className="flex items-center gap-1 flex-shrink-0">
-                    <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => moveSource(source, -1)} title="上移(提高优先级)">
-                      <ChevronUp className="w-3.5 h-3.5" />
-                    </Button>
-                    <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => moveSource(source, 1)} title="下移">
-                      <ChevronDown className="w-3.5 h-3.5" />
-                    </Button>
+                    {isAdmin && (
+                      <>
+                        <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => moveSource(source, -1)} title="上移(提高优先级)">
+                          <ChevronUp className="w-3.5 h-3.5" />
+                        </Button>
+                        <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => moveSource(source, 1)} title="下移">
+                          <ChevronDown className="w-3.5 h-3.5" />
+                        </Button>
+                      </>
+                    )}
                     <Button
                       variant="ghost"
                       size="icon"
@@ -324,10 +332,14 @@ export default function DataSourcesPage() {
                         <Play className="w-3.5 h-3.5" />
                       )}
                     </Button>
-                    <Switch checked={source.enabled} onCheckedChange={() => toggleEnabled(source)} />
-                    <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => openDialog(source)} title="设置">
-                      <Pencil className="w-3.5 h-3.5" />
-                    </Button>
+                    {isAdmin && (
+                      <>
+                        <Switch checked={source.enabled} onCheckedChange={() => toggleEnabled(source)} />
+                        <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => openDialog(source)} title="设置">
+                          <Pencil className="w-3.5 h-3.5" />
+                        </Button>
+                      </>
+                    )}
                   </div>
                 </div>
             ))}
@@ -352,14 +364,16 @@ export default function DataSourcesPage() {
           <h1 className="text-[20px] md:text-[22px] font-bold text-foreground tracking-tight">数据源</h1>
           <p className="text-[12px] md:text-[13px] text-muted-foreground mt-0.5 md:mt-1">管理新闻、K线、资金流向和行情数据来源</p>
         </div>
-        <Button variant="outline" size="sm" className="h-8 text-[12px] flex-shrink-0" onClick={resetToSeed} disabled={resetting}>
-          {resetting ? (
-            <span className="w-3.5 h-3.5 mr-1.5 border-2 border-current/30 border-t-current rounded-full animate-spin" />
-          ) : (
-            <RotateCcw className="w-3.5 h-3.5 mr-1.5" />
-          )}
-          恢复默认
-        </Button>
+        {isAdmin && (
+          <Button variant="outline" size="sm" className="h-8 text-[12px] flex-shrink-0" onClick={resetToSeed} disabled={resetting}>
+            {resetting ? (
+              <span className="w-3.5 h-3.5 mr-1.5 border-2 border-current/30 border-t-current rounded-full animate-spin" />
+            ) : (
+              <RotateCcw className="w-3.5 h-3.5 mr-1.5" />
+            )}
+            恢复默认
+          </Button>
+        )}
       </div>
 
       <div className="space-y-6">

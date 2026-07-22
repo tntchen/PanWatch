@@ -1395,9 +1395,18 @@ def _build_notifier(
 
 
 def _build_ai_client(
-    model: AIModel | None, service: AIService | None, proxy: str
+    model: AIModel | None,
+    service: AIService | None,
+    proxy: str,
+    tenant_id: int = DEFAULT_TENANT_ID,
 ) -> AIClient:
-    """根据解析后的 model+service 构建 AIClient"""
+    """根据解析后的 model+service 构建 AIClient。
+
+    env 凭证回退（Settings 读取 .env）仅限管理员租户（docs/23 P10/F6，
+    docs/26-J11 已裁决）：T20「env 凭证→初始管理员」，普通租户可见集为空时
+    不得回退 env，否则等于全员共享管理员 key（违背 T13）。单租户直通模式
+    tenant_id 恒为 1，与旧链行为等价。
+    """
     if model and service:
         return AIClient(
             base_url=service.base_url,
@@ -1405,14 +1414,21 @@ def _build_ai_client(
             model=model.model,
             proxy=proxy,
         )
-    # 回退到环境变量配置
-    settings = Settings()
-    return AIClient(
-        base_url=settings.ai_base_url,
-        api_key=settings.ai_api_key,
-        model=settings.ai_model,
-        proxy=proxy,
+    if tenant_id == DEFAULT_TENANT_ID:
+        # 回退到环境变量配置（仅管理员租户）
+        settings = Settings()
+        return AIClient(
+            base_url=settings.ai_base_url,
+            api_key=settings.ai_api_key,
+            model=settings.ai_model,
+            proxy=proxy,
+        )
+    # 普通租户未配置 AI：返回空凭证占位客户端（调用即失败并在运行记录中
+    # 体现「未配置」，不泄露管理员 env 凭证）
+    logger.warning(
+        f"租户 {tenant_id} 未配置可用 AI 模型，Agent 本次运行将无法调用 AI"
     )
+    return AIClient(base_url="", api_key="panwatch-unconfigured", model="", proxy=proxy)
 
 
 def build_context(
@@ -1431,7 +1447,7 @@ def build_context(
     proxy = _get_proxy() or settings.http_proxy
 
     model, service = resolve_ai_model(agent_name, stock_agent_id, tenant_id=tenant_id)
-    ai_client = _build_ai_client(model, service, proxy)
+    ai_client = _build_ai_client(model, service, proxy, tenant_id=tenant_id)
     channels = resolve_notify_channels(agent_name, stock_agent_id, tenant_id=tenant_id)
     notifier = _build_notifier(channels, tenant_id=tenant_id)
 
@@ -1716,7 +1732,7 @@ async def trigger_agent_for_stock(
         )
         _log_trigger_info(agent_name, [stock], model, service, channels)
 
-        ai_client = _build_ai_client(model, service, proxy)
+        ai_client = _build_ai_client(model, service, proxy, tenant_id=tenant_id)
         notifier = _build_notifier(channels, tenant_id=tenant_id)
 
         model_label = f"{service.name}/{model.model}" if model and service else ""

@@ -7,6 +7,8 @@ import {
   portfolioApi,
   recommendationsApi,
   homeApi,
+  scopedGet,
+  scopedSet,
   type DashboardMarketIndex,
   type DashboardMonitorStock,
   type DashboardOverviewResponse,
@@ -130,11 +132,11 @@ export default function DashboardPage() {
 
   useEffect(() => {
     load()
-    if (!localStorage.getItem('panwatch_onboarding_completed')) setShowOnboarding(true)
+    if (!scopedGet('panwatch_onboarding_completed')) setShowOnboarding(true)
   }, [load])
 
   const handleOnboardingComplete = () => {
-    localStorage.setItem('panwatch_onboarding_completed', 'true')
+    scopedSet('panwatch_onboarding_completed', 'true')
     setShowOnboarding(false)
   }
 

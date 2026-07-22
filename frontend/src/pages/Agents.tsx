@@ -8,6 +8,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } f
 import { Label } from '@panwatch/base-ui/components/ui/label'
 import { Input } from '@panwatch/base-ui/components/ui/input'
 import { useToast } from '@panwatch/base-ui/components/ui/toast'
+import { useAuthUser } from '../hooks/use-auth-user'
 
 interface AgentConfig {
   id: number
@@ -150,6 +151,9 @@ function formatSchedule(cron: string): string {
 }
 
 export default function AgentsPage() {
+  const me = useAuthUser()
+  // MT-P4：策略配置写操作仅管理员（docs/27 行26）；触发/运行状态/绑定保留给全部用户
+  const isAdmin = !me || me.role === 'admin'
   const [agents, setAgents] = useState<AgentConfig[]>([])
   const [stocks, setStocks] = useState<StockConfig[]>([])
   const [services, setServices] = useState<AIService[]>([])
@@ -563,15 +567,22 @@ export default function AgentsPage() {
 
                     {/* 执行周期 - 可点击编辑 */}
                     <div className="flex items-center gap-2.5 mt-3.5 ml-[22px] flex-wrap">
-                      <button
-                        onClick={() => openScheduleDialog(agent)}
-                        className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-accent/50 hover:bg-accent transition-colors"
-                      >
-                        <Clock className="w-3.5 h-3.5 text-muted-foreground" />
-                        <span className="text-[12px] text-foreground">{formatSchedule(agent.schedule)}</span>
-                        <Settings2 className="w-3 h-3 text-muted-foreground/50" />
-                      </button>
-                      {agent.name === 'tradingagents' && (
+                      {isAdmin ? (
+                        <button
+                          onClick={() => openScheduleDialog(agent)}
+                          className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-accent/50 hover:bg-accent transition-colors"
+                        >
+                          <Clock className="w-3.5 h-3.5 text-muted-foreground" />
+                          <span className="text-[12px] text-foreground">{formatSchedule(agent.schedule)}</span>
+                          <Settings2 className="w-3 h-3 text-muted-foreground/50" />
+                        </button>
+                      ) : (
+                        <span className="flex items-center gap-1.5 px-2.5 py-1 text-[12px] text-muted-foreground">
+                          <Clock className="w-3.5 h-3.5" />
+                          {formatSchedule(agent.schedule)}
+                        </span>
+                      )}
+                      {isAdmin && agent.name === 'tradingagents' && (
                         <button
                           onClick={() => setTaConfigAgent(agent)}
                           className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-primary/10 hover:bg-primary/20 transition-colors text-primary"
@@ -683,15 +694,17 @@ export default function AgentsPage() {
                     >
                       <span className="text-[12px]">最近运行</span>
                     </Button>
-                    <Button
-                      variant={agent.enabled ? 'destructive' : 'default'}
-                      size="sm"
-                      className="h-8"
-                      onClick={() => toggleAgent(agent)}
-                    >
-                      <Power className="w-3.5 h-3.5" />
-                      <span className="hidden sm:inline">{agent.enabled ? '停用' : '启用'}</span>
-                    </Button>
+                    {isAdmin && (
+                      <Button
+                        variant={agent.enabled ? 'destructive' : 'default'}
+                        size="sm"
+                        className="h-8"
+                        onClick={() => toggleAgent(agent)}
+                      >
+                        <Power className="w-3.5 h-3.5" />
+                        <span className="hidden sm:inline">{agent.enabled ? '停用' : '启用'}</span>
+                      </Button>
+                    )}
                   </div>
                 </div>
 
