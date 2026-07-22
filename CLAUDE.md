@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What is PanWatch
 
-PanWatch (盯盘侠) is a self-hosted AI stock assistant with real-time market monitoring, technical analysis, multi-account portfolio management, and paper trading. It supports A-shares (CN), Hong Kong (HK), and US markets.
+PanWatch (盯盯) is a self-hosted AI stock assistant with real-time market monitoring, technical analysis, multi-account portfolio management, and paper trading. It supports A-shares (CN), Hong Kong (HK), and US markets.
 
 ## Build & Run Commands
 
