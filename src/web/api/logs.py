@@ -12,6 +12,19 @@ from src.web.database import get_db
 from src.web.models import LogEntry
 from src.web.api.auth import get_current_user
 from src.web.log_handler import get_log_handler_stats
+from src.web.tenant_context import current_tenant, single_tenant_mode
+
+
+def _scope_tenant_count(query):
+    """MT-P5 修复 D5：Query.count() 生成匿名子查询，do_orm_execute 的实体判定失效，
+    total 会跨租户计数；在 count 前显式补 tenant 谓词（与 apply_tenant_filter
+    同口径）。单租户直通 / 无 ctx 保持原语义。"""
+    if single_tenant_mode():
+        return query
+    ctx = current_tenant()
+    if ctx is None:
+        return query
+    return query.filter(LogEntry.tenant_id == ctx.tenant_id)
 
 
 def _resolve_role(user: Any) -> str:
@@ -168,7 +181,7 @@ def list_logs(
         except ValueError:
             pass
 
-    total = query.count()
+    total = _scope_tenant_count(query).count()
     has_more = False
     next_before_id = None
 
@@ -257,7 +270,7 @@ def logs_meta(
         except ValueError:
             pass
 
-    total = query.count()
+    total = _scope_tenant_count(query).count()
     level_dist = (
         query.with_entities(LogEntry.level, func.count(LogEntry.id))
         .group_by(LogEntry.level)

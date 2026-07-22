@@ -30,6 +30,12 @@
 - 行情统一入口是 `src/core/marketdata_client.py`：`get_market_data()` 进程级单例，`DbConfigProvider` 每次现查 DB `DataSource` 表（type/enabled/priority/supports_batch）映射成 vendor 配置；`md_quote_rows()` 是**同步函数**，async 路由用 `asyncio.to_thread` 调用。
 - 新闻统一入口是 `NewsCollector.from_database()`（按 `DataSource` 表 type="news" 构建）。
 
+## 缓存与数据的租户归属（多租户，2026-07）
+
+- **市场级共享（T7 设计意图）**：行情/K线/资金流/指数等市场数据无租户隐私，`md_quote_rows`、`KlineCollector` 正/负缓存与取数锁、`data/stock_list_cache.json`、东财 discovery 实时源均按 symbol/market 键控、全租户共享一份，避免重复消耗上游配额触发限流。`/api/market/indices` 仍是公共接口。
+- **租户隔离（do_orm_execute 自动过滤）**：`stocks` 每租户复制（UQ `(tenant_id, symbol, market)`），stocks.py 自选股 CRUD/绑定/触发、news.py 的自选股名称映射、insights.py 的建议池、context.py 的上下文快照/话题/预测后验、dashboard.py 的持仓/报告聚合，读的均为租户私有表；多租户模式下机制点自动注入 `tenant_id = 当前租户` 谓词（机制见 docs/01「五·补」）。
+- **进程内缓存租户化**：discovery `_cache`、insights `_ANN_CACHE`、agents 盘中扫描、accounts 组合分析等内存缓存 key 已加租户前缀（MT-P2），跨租户既不互见也不互踢。
+
 ## 各模块要点
 
 ### quotes.py（105 行）

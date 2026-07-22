@@ -23,8 +23,8 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from typing import Any, Iterator, Optional, Set
 
-from sqlalchemy import inspect as sa_inspect
-from sqlalchemy.orm import with_loader_criteria
+from sqlalchemy import event, inspect as sa_inspect
+from sqlalchemy.orm import Session, with_loader_criteria
 
 logger = logging.getLogger(__name__)
 
@@ -303,3 +303,45 @@ def apply_tenant_filter(execute_state: Any) -> None:
         predicate = _dml_predicate(table, ctx)
         if predicate is not None:
             execute_state.statement = statement.where(predicate)
+
+
+# ---------------------------------------------------------------------------
+# INSERT 侧写入守卫：before_flush tenant 归属（docs/25 §4.1 scoped_insert）
+# ---------------------------------------------------------------------------
+
+
+def scoped_insert_attribution(session: Any, flush_context: Any, instances: Any) -> None:
+    """before_flush 钩子：给未显式赋值 tenant_id 的新建行补上当前租户归属。
+
+    规则（与 docs/25 §4.1 设计一致）：
+      a) 仅处理 session.new 中有 tenant_id 映射列的对象（复用
+         ``_tenant_column_cache`` 反射缓存；缓存未初始化时按无列处理，
+         与读侧 ``_table_has_tenant_column`` 同一安全默认）；
+      b) 仅当 ``obj.tenant_id is None`` 且 ``current_tenant()`` 非空时赋
+         ``ctx.tenant_id``——显式赋值过的行一律不动（硬约束：tenant_id=0
+         市场级哨兵行、admin 为他租户建的 users 行等）；
+      c) 无 ctx（裸脚本/后台无 tenant_scope 路径）不动，server_default="1"
+         照旧，与改造前行为等价。
+    防御说明：单租户直通模式下无需短路——该模式下 ctx.tenant_id 恒为默认
+    租户 1（= server_default），赋值与否结果等价。
+    """
+    ctx = current_tenant()
+    if ctx is None:
+        return
+    for obj in session.new:
+        table = getattr(obj, "__table__", None)
+        if table is None:
+            continue
+        if not _table_has_tenant_column(table.name):
+            continue
+        if not hasattr(obj, "tenant_id"):
+            # schema 有列但模型未映射（迁移双轨窗口期），跳过防 AttributeError
+            continue
+        if obj.tenant_id is None:
+            obj.tenant_id = ctx.tenant_id
+
+
+# 全局注册到 sqlalchemy.orm.Session 类（有意为之，区别于 do_orm_execute 挂
+# database.SessionLocal 工厂）：测试套件自建 sessionmaker 不经 SessionLocal，
+# 全局注册保证生产与测试的所有 Session 实例都自动获得写入守卫。
+event.listen(Session, "before_flush", scoped_insert_attribution)

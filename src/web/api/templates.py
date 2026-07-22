@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from src.web.database import get_db
 from src.web.models import AgentConfig, AppSettings, Stock, StockAgent
+from src.web.api.auth import require_admin
 from src.core.agent_catalog import AGENT_KIND_CAPABILITY, infer_agent_kind
 
 
@@ -65,6 +66,7 @@ _SETTINGS_KEYS = {
 def export_template(
     include_internal: bool = Query(default=True),
     db: Session = Depends(get_db),
+    _: object = Depends(require_admin),  # T20：配置包导出管理员专属
 ):
     """导出当前配置为可导入的配置包 JSON"""
     settings_rows = (
@@ -138,6 +140,7 @@ def import_template(
         "merge", description="merge=合并更新, replace=替换(仅对 payload 涵盖的数据)"
     ),
     db: Session = Depends(get_db),
+    _: object = Depends(require_admin),  # T20：配置包导入管理员专属（与导出同口径）
 ):
     """导入配置包。默认 merge：仅更新/创建 payload 中包含的对象。"""
 

@@ -25,7 +25,9 @@ from src.web.models import (
     PaperTradingAccount,
     PaperTradingPosition,
     PaperTradingTrade,
+    TenantSettings,
 )
+from src.web.tenant_context import current_tenant, single_tenant_mode
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -380,6 +382,11 @@ def list_trades(limit: int = 50, offset: int = 0, market: str | None = None, db:
     base = db.query(PaperTradingTrade)
     if market in ALL_MARKETS:
         base = base.filter(PaperTradingTrade.stock_market == market)
+    # MT-P5 修复 D5：Query.count() 生成匿名子查询，do_orm_execute 实体判定失效，
+    # total 会跨租户计数；显式补 tenant 谓词（单租户直通 / 无 ctx 保持原语义）。
+    ctx = None if single_tenant_mode() else current_tenant()
+    if ctx is not None:
+        base = base.filter(PaperTradingTrade.tenant_id == ctx.tenant_id)
     total = base.count()
     rows = (
         base.order_by(PaperTradingTrade.closed_at.desc())
@@ -513,6 +520,16 @@ _NOTIFY_DEFAULTS = {
 }
 
 
+def _notify_tenant_id() -> int | None:
+    """MT-P5 修复 D4：多租户且持租户上下文时按租户读写 tenant_settings（与运行时
+    paper_trading_notifier._load_config 的 tenant_settings 优先口径一致）；
+    单租户直通 / 无 ctx 返回 None，维持 app_settings 原行为。"""
+    if single_tenant_mode():
+        return None
+    ctx = current_tenant()
+    return ctx.tenant_id if ctx is not None else None
+
+
 @router.get("/notify-settings")
 def get_notify_settings(db: Session = Depends(get_db)):
     """返回当前通知配置 + 可用渠道列表。"""
@@ -520,6 +537,21 @@ def get_notify_settings(db: Session = Depends(get_db)):
     settings = dict(_NOTIFY_DEFAULTS)
     for r in rows:
         settings[r.key] = r.value or _NOTIFY_DEFAULTS.get(r.key, "")
+
+    # 多租户：tenant_settings 优先覆盖（与运行时读面一致）
+    tenant_id = _notify_tenant_id()
+    if tenant_id is not None:
+        trows = (
+            db.query(TenantSettings)
+            .filter(
+                TenantSettings.tenant_id == tenant_id,
+                TenantSettings.key.in_(_NOTIFY_KEYS),
+            )
+            .all()
+        )
+        for r in trows:
+            if r.value:
+                settings[r.key] = r.value
 
     channels = db.query(NotifyChannel).filter(NotifyChannel.enabled.is_(True)).all()
     channel_list = [
@@ -540,14 +572,36 @@ class NotifySettingsBody(BaseModel):
 
 @router.post("/notify-settings")
 def update_notify_settings(body: NotifySettingsBody, db: Session = Depends(get_db)):
-    """更新通知配置。"""
+    """更新通知配置。多租户下落 tenant_settings（MT-P5 修复 D4），单租户维持 app_settings。"""
     updates = {k: v for k, v in body.model_dump().items() if v is not None}
+    tenant_id = _notify_tenant_id()
     for key, value in updates.items():
-        row = db.query(AppSettings).filter(AppSettings.key == key).first()
-        if row:
-            row.value = value
+        if tenant_id is not None:
+            trow = (
+                db.query(TenantSettings)
+                .filter(
+                    TenantSettings.tenant_id == tenant_id,
+                    TenantSettings.key == key,
+                )
+                .first()
+            )
+            if trow:
+                trow.value = value
+            else:
+                db.add(
+                    TenantSettings(
+                        tenant_id=tenant_id,
+                        key=key,
+                        value=value,
+                        description=f"模拟盘通知配置: {key}",
+                    )
+                )
         else:
-            db.add(AppSettings(key=key, value=value, description=f"模拟盘通知配置: {key}"))
+            row = db.query(AppSettings).filter(AppSettings.key == key).first()
+            if row:
+                row.value = value
+            else:
+                db.add(AppSettings(key=key, value=value, description=f"模拟盘通知配置: {key}"))
     db.commit()
     return get_notify_settings(db)
 

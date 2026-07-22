@@ -7,8 +7,9 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
 from src.web.database import get_db
-from src.web.models import AppSettings
+from src.web.models import AppSettings, TenantSettings
 from src.web.api.auth import get_current_user
+from src.web.tenant_context import current_tenant, single_tenant_mode
 from src.config import Settings
 from src.core.update_checker import check_update
 
@@ -70,7 +71,9 @@ INSTANCE_LEVEL_KEYS = frozenset({
     "panwatch_base_url",
     "single_tenant_mode",
 })
-# 租户级：普通用户可写；MT-P1 阶段仍落全局 app_settings 行（tenant 化在 MT-P2）
+# 租户级：普通用户可写；多租户下落 tenant_settings（T20 三分写面收口，MT-P5 修复 D3），
+# 单租户直通 / 无租户上下文时维持 app_settings 共享行（运行时单租户只读 app_settings，
+# 保证读写闭环与改造前等价）。
 # stock_link_platform 未列入 docs/21 §7.1 映射表，按 UI 偏好归为租户级
 TENANT_LEVEL_KEYS = frozenset({
     "notify_quiet_hours",
@@ -80,6 +83,42 @@ TENANT_LEVEL_KEYS = frozenset({
     "ui_avatar",
     "stock_link_platform",
 })
+
+
+def _tenant_kv_tenant_id() -> int | None:
+    """多租户且持租户上下文时返回当前 tenant_id（租户级键读写落 tenant_settings）。
+
+    单租户直通 / 无 ctx（公开路由、测试替身用户）返回 None：维持 app_settings
+    原行为——运行时读面（price_alert_engine._build_notify_policy、
+    paper_trading_notifier._load_config）在单租户下只读 app_settings。
+    """
+    if single_tenant_mode():
+        return None
+    ctx = current_tenant()
+    return ctx.tenant_id if ctx is not None else None
+
+
+def _tenant_kv_get(db: Session, tenant_id: int, key: str) -> "TenantSettings | None":
+    return (
+        db.query(TenantSettings)
+        .filter(TenantSettings.tenant_id == tenant_id, TenantSettings.key == key)
+        .first()
+    )
+
+
+def _tenant_kv_upsert(
+    db: Session, tenant_id: int, key: str, value: str, description: str = ""
+) -> TenantSettings:
+    """upsert tenant_settings 行（复合主键 (tenant_id, key)，v120 已建表）。"""
+    row = _tenant_kv_get(db, tenant_id, key)
+    if row:
+        row.value = value
+    else:
+        row = TenantSettings(
+            tenant_id=tenant_id, key=key, value=value, description=description
+        )
+        db.add(row)
+    return row
 
 
 def _resolve_role(user: Any) -> str:
@@ -132,6 +171,31 @@ def list_settings(db: Session = Depends(get_db)):
             result.append(s)
     db.commit()
 
+    # MT-P5 修复 D3 读面一致性：多租户下租户级键叠加本租户 tenant_settings 值
+    # （tenant_settings 优先，缺省回退 app_settings/env 默认），避免用户写后读回旧值。
+    tenant_id = _tenant_kv_tenant_id()
+    if tenant_id is not None:
+        trows = (
+            db.query(TenantSettings)
+            .filter(
+                TenantSettings.tenant_id == tenant_id,
+                TenantSettings.key.in_(SETTING_KEYS),
+            )
+            .all()
+        )
+        tmap = {r.key: r.value for r in trows if r.value}
+        if tmap:
+            result = [
+                SettingResponse(
+                    key=s.key,
+                    value=tmap[s.key],
+                    description=s.description or SETTING_DESCRIPTIONS.get(s.key, ""),
+                )
+                if s.key in tmap
+                else s
+                for s in result
+            ]
+
     return result
 
 
@@ -149,9 +213,16 @@ def get_avatar(db: Session = Depends(get_db)):
     """读取用户头像:DB 存文件名,图片本体在 data/avatars/,读取后以 data URL 返回。
 
     GET /avatar 无同名 GET /{key},不存在路由抢匹配问题。
+    多租户下 tenant_settings 优先、app_settings 回退（MT-P5 修复 D3）。
     """
-    row = db.query(AppSettings).filter(AppSettings.key == AVATAR_KEY).first()
-    fname = (row.value if row and row.value else "").strip()
+    tenant_id = _tenant_kv_tenant_id()
+    fname = ""
+    if tenant_id is not None:
+        trow = _tenant_kv_get(db, tenant_id, AVATAR_KEY)
+        fname = (trow.value if trow and trow.value else "").strip()
+    if not fname:
+        row = db.query(AppSettings).filter(AppSettings.key == AVATAR_KEY).first()
+        fname = (row.value if row and row.value else "").strip()
     if not fname:
         return {"value": ""}
     path = os.path.join(_avatar_dir(), fname)
@@ -171,9 +242,21 @@ def set_avatar(update: SettingUpdate, db: Session = Depends(get_db)):
     """保存/清空用户头像:把 data URL 落成 data/avatars/avatar.* 文件,DB 仅记文件名。
 
     需在 /{key} 之前注册以优先匹配。传空字符串即清空(删文件 + 清记录)。
+    多租户下记录落 tenant_settings、文件名带租户前缀（MT-P5 修复 D3）；
+    单租户直通维持 app_settings + avatar.* 原行为。
     """
-    row = db.query(AppSettings).filter(AppSettings.key == AVATAR_KEY).first()
-    old = (row.value if row else "") or ""
+    tenant_id = _tenant_kv_tenant_id()
+    row = None
+    trow = None
+    if tenant_id is not None:
+        trow = _tenant_kv_get(db, tenant_id, AVATAR_KEY)
+        old = (trow.value if trow and trow.value else "").strip()
+        if not old:  # 回退共享行取旧文件名（仅用于清理旧文件）
+            arow = db.query(AppSettings).filter(AppSettings.key == AVATAR_KEY).first()
+            old = (arow.value if arow else "") or ""
+    else:
+        row = db.query(AppSettings).filter(AppSettings.key == AVATAR_KEY).first()
+        old = (row.value if row else "") or ""
     value = (update.value or "").strip()
 
     if not value:
@@ -182,6 +265,8 @@ def set_avatar(update: SettingUpdate, db: Session = Depends(get_db)):
                 os.remove(os.path.join(_avatar_dir(), old))
             except OSError:
                 pass
+        if trow is not None:
+            trow.value = ""
         if row:
             row.value = ""
         db.commit()
@@ -196,7 +281,8 @@ def set_avatar(update: SettingUpdate, db: Session = Depends(get_db)):
     except Exception:
         raise HTTPException(400, "头像数据无效")
 
-    fname = f"avatar.{ext}"
+    # 多租户下文件名带租户前缀，避免跨租户互相覆盖 data/avatars/ 下的文件
+    fname = f"avatar_t{tenant_id}.{ext}" if tenant_id is not None else f"avatar.{ext}"
     with open(os.path.join(_avatar_dir(), fname), "wb") as f:
         f.write(raw)
     if old and old != fname:  # 扩展名变化时清掉旧文件
@@ -204,7 +290,9 @@ def set_avatar(update: SettingUpdate, db: Session = Depends(get_db)):
             os.remove(os.path.join(_avatar_dir(), old))
         except OSError:
             pass
-    if not row:
+    if tenant_id is not None:
+        _tenant_kv_upsert(db, tenant_id, AVATAR_KEY, fname, "用户头像文件名")
+    elif not row:
         row = AppSettings(key=AVATAR_KEY, value=fname, description="用户头像文件名")
         db.add(row)
     else:
@@ -226,6 +314,21 @@ def update_setting(
             raise HTTPException(403, "实例级配置仅管理员可修改")
     elif key not in TENANT_LEVEL_KEYS:
         raise HTTPException(400, f"不支持的配置项: {key}")
+
+    # MT-P5 修复 D3：租户级键在多租户下 upsert 进 tenant_settings（与运行时
+    # tenant_settings 优先的读面一致），不再写共享 app_settings；
+    # 单租户直通 / 无 ctx 维持 app_settings 原行为。
+    tenant_id = _tenant_kv_tenant_id() if key in TENANT_LEVEL_KEYS else None
+    if tenant_id is not None:
+        row = _tenant_kv_upsert(
+            db, tenant_id, key, update.value, SETTING_DESCRIPTIONS.get(key, "")
+        )
+        db.commit()
+        return SettingResponse(
+            key=key,
+            value=row.value,
+            description=row.description or SETTING_DESCRIPTIONS.get(key, ""),
+        )
 
     setting = db.query(AppSettings).filter(AppSettings.key == key).first()
     if not setting:
