@@ -644,18 +644,25 @@ class PriceAlertEngine:
                     items.append({"rule_id": rule.id, "status": "duplicated"})
                     continue
 
-                notify_ok, notify_err = await self._send_notify(db, rule, ev.snapshot)
-                hit.notify_success = bool(notify_ok)
-                hit.notify_error = notify_err or ""
-
+                # 规则状态与命中记录先一次性提交，立即释放 SQLite 写锁——
+                # 通知发送是网络 I/O，绝不能放在写事务内（此前写锁会跨
+                # 整个通知网络调用持有，并发时拖垮其它写者）。
                 rule.last_trigger_at = now
                 rule.last_trigger_price = _safe_float(quote.get("current_price"))
                 rule.trigger_count_today = int(rule.trigger_count_today or 0) + 1
                 rule.trigger_date = _day_key(now)
                 if rule.repeat_mode == "once":
                     rule.enabled = False
-
                 db.commit()
+
+                notify_ok, notify_err = await self._send_notify(db, rule, ev.snapshot)
+                hit.notify_success = bool(notify_ok)
+                hit.notify_error = notify_err or ""
+                try:
+                    db.commit()  # 小事务：仅回写通知结果
+                except Exception:
+                    db.rollback()
+                    logger.warning("[价格提醒] 通知结果回写失败 rule=%s", rule.id)
                 triggered += 1
                 items.append(
                     {

@@ -540,7 +540,37 @@ class PaperTradingEngine:
         syms = [(p.stock_symbol, p.stock_market) for p in positions]
         quotes = self._fetch_quotes_map(syms)
 
+        # fetch-then-write：循环前一次性预取全部信号数据（只读查询），
+        # 循环体内零 DB 查询，配合 no_autoflush 保证写锁只在末尾 commit 瞬间持有。
+        sig_positions = [p for p in positions if p.signal_run_id]
+        latest_signal_actions: dict[tuple[str, str], str] = {}
+        signal_hold_days: dict[int, int] = {}
+        if sig_positions:
+            sig_keys = {(p.stock_symbol, p.stock_market) for p in sig_positions}
+            latest_rows = (
+                db.query(StrategySignalRun.stock_symbol, StrategySignalRun.stock_market, StrategySignalRun.action)
+                .filter(
+                    StrategySignalRun.stock_market.in_([m for _, m in sig_keys]),
+                    StrategySignalRun.status == "active",
+                )
+                .order_by(StrategySignalRun.created_at.desc())
+                .all()
+            )
+            for sym, mkt, action in latest_rows:
+                key = (sym, mkt)
+                if key in sig_keys and key not in latest_signal_actions:
+                    latest_signal_actions[key] = action
+            run_ids = {p.signal_run_id for p in sig_positions}
+            for rid, hd in (
+                db.query(StrategySignalRun.id, StrategySignalRun.holding_days)
+                .filter(StrategySignalRun.id.in_(run_ids))
+                .all()
+            ):
+                if hd and int(hd) > 0:
+                    signal_hold_days[rid] = int(hd)
+
         closed = 0
+        # 循环体内已无任何 DB 查询（信号数据全部预取），不会触发 autoflush。
         for pos in positions:
             # 跳过本轮刚建仓的持仓
             if skip_keys and (pos.stock_symbol, pos.stock_market) in skip_keys:
@@ -585,23 +615,10 @@ class PaperTradingEngine:
                         closed += 1
                         continue
 
-            # 检查信号反转
+            # 检查信号反转（信号数据已在循环前批量预取，零 DB 查询）
             if pos.signal_run_id:
-                # no_autoflush: 信号查询是只读的,不要把本轮累积的持仓现价更新提前 flush——
-                # 否则扫描中途会反复抢 SQLite 写锁,与其它调度器并发写时触发 "database is locked"。
-                # 所有写入统一在本方法末尾 db.commit() 时一次性落盘。
-                with db.no_autoflush:
-                    latest = (
-                        db.query(StrategySignalRun)
-                        .filter(
-                            StrategySignalRun.stock_symbol == pos.stock_symbol,
-                            StrategySignalRun.stock_market == pos.stock_market,
-                            StrategySignalRun.status == "active",
-                        )
-                        .order_by(StrategySignalRun.created_at.desc())
-                        .first()
-                    )
-                if latest and latest.action in ("sell", "reduce"):
+                latest_action = latest_signal_actions.get((pos.stock_symbol, pos.stock_market))
+                if latest_action in ("sell", "reduce"):
                     trade = self._close_position(db, account, pos, current_price, "signal_reversal")
                     exit_events.append((pos, trade))
                     closed += 1
@@ -610,13 +627,9 @@ class PaperTradingEngine:
             # 时间止损:持有超过最大自然日离场(优先用 signal 的 holding_days)
             max_days = DEFAULT_TIME_STOP_DAYS
             if pos.signal_run_id:
-                sig_hold = (
-                    db.query(StrategySignalRun.holding_days)
-                    .filter(StrategySignalRun.id == pos.signal_run_id)
-                    .scalar()
-                )
-                if sig_hold and int(sig_hold) > 0:
-                    max_days = int(sig_hold)
+                sig_hold = signal_hold_days.get(pos.signal_run_id)
+                if sig_hold and sig_hold > 0:
+                    max_days = sig_hold
             if pos.opened_at:
                 opened_dt = pos.opened_at
                 if opened_dt.tzinfo is None:
@@ -627,18 +640,29 @@ class PaperTradingEngine:
                     closed += 1
                     continue
 
-        self._update_account_metrics(db, account)
+        open_after = [p for p in positions if p.status == "open"]
+        self._update_account_metrics(db, account, open_positions=open_after)
         db.commit()
         return closed, exit_events
 
-    def _update_account_metrics(self, db: Session, account: PaperTradingAccount) -> None:
-        """更新账户峰值和最大回撤。"""
+    def _update_account_metrics(
+        self,
+        db: Session,
+        account: PaperTradingAccount,
+        open_positions: list[PaperTradingPosition] | None = None,
+    ) -> None:
+        """更新账户峰值和最大回撤。
+
+        open_positions 由调用方传入时直接用内存状态（fetch-then-write，
+        避免 commit 前最后一次查询触发 autoflush）；缺省回退到 DB 查询。
+        """
         # 计算包含浮动盈亏的总资产
-        open_positions = (
-            db.query(PaperTradingPosition)
-            .filter(PaperTradingPosition.status == "open")
-            .all()
-        )
+        if open_positions is None:
+            open_positions = (
+                db.query(PaperTradingPosition)
+                .filter(PaperTradingPosition.status == "open")
+                .all()
+            )
         unrealized_total = sum(p.unrealized_pnl or 0 for p in open_positions)
         total_equity = account.current_capital + sum(
             (p.current_price or p.entry_price) * p.quantity for p in open_positions
