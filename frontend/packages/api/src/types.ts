@@ -39,6 +39,10 @@ export interface SourceHealth {
   p50_latency_ms: number | null
   last_error?: string
   last_success_at?: number
+  last_attempt_at?: number
+  consecutive_failures?: number
+  circuit_open?: boolean
+  circuit_open_until?: number
 }
 
 export interface DataSource {

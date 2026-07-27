@@ -140,13 +140,13 @@ def _is_orphan(type_: str, provider: str) -> bool:
     return provider not in legal
 
 
-def _to_response(source: DataSource, health_map: dict | None = None) -> dict:
+def _to_response(source: DataSource, health_map: dict | None = None, health: dict | None = None) -> dict:
     """转换为响应格式。health_map: {provider: 指标快照};缺失则 health=None。
 
     D5：多租户模式下非 admin 用户 config 掩码为 {}（凭证不出网）；
     admin 明文不变；单租户直通/无 ctx 与现状完全一致。
     """
-    health = (health_map or {}).get(source.provider)
+    health = health if health is not None else (health_map or {}).get(source.provider)
     return {
         "id": source.id,
         "name": source.name,
@@ -164,6 +164,14 @@ def _to_response(source: DataSource, health_map: dict | None = None) -> dict:
     }
 
 
+def _precise_health(market_data, source: DataSource, health_map: dict) -> dict | None:
+    """R2 精确健康度；兼容旧测试替身和外部实现。"""
+    method = getattr(market_data, "health_for", None)
+    if callable(method):
+        return method(source.type, source.provider)
+    return health_map.get(source.provider)
+
+
 @router.get("")
 def list_datasources(type: str | None = None, db: Session = Depends(get_db)):
     """获取数据源列表，可按类型筛选"""
@@ -172,8 +180,12 @@ def list_datasources(type: str | None = None, db: Session = Depends(get_db)):
         query = query.filter(DataSource.type == type)
     sources = query.order_by(DataSource.type, DataSource.priority, DataSource.id).all()
     from src.core.marketdata_client import get_market_data
-    health_map = get_market_data().health()
-    return [_to_response(s, health_map) for s in sources]
+    market_data = get_market_data()
+    health_map = market_data.health()
+    return [
+        _to_response(s, health_map, _precise_health(market_data, s, health_map))
+        for s in sources
+    ]
 
 
 @router.get("/types")
@@ -200,7 +212,9 @@ def get_datasource(source_id: int, db: Session = Depends(get_db)):
     source = db.query(DataSource).filter(DataSource.id == source_id).first()
     if not source:
         raise HTTPException(status_code=404, detail="数据源不存在")
-    return _to_response(source)
+    from src.core.marketdata_client import get_market_data
+    market_data = get_market_data()
+    return _to_response(source, health=_precise_health(market_data, source, market_data.health()))
 
 
 @router.post("")

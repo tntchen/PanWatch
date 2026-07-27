@@ -1,6 +1,6 @@
 # 19 · Tushare 数据源回归计划
 
-> 状态：✅ 已完成（2026-07-22，D1–D4 按推荐口径、D4 fork 私有、D5 同意）。改动未提交。
+> 状态：✅ K 线 vendor 回归完成；R1（2026-07-27）已确认将 `tushare` 升级为应用镜像必装依赖，待随 0.4.4 发布。
 > 日期：2026-07-22 ｜ 2026-07-22 晚追加「多租户影响评估」（MT-P5 闭环后）
 
 ## 背景
@@ -72,9 +72,7 @@
 ## 决策点（待所有者逐条确认）
 
 - **D1 · 默认启用状态**：建议 `enabled=False`（需 token 才能用，默认启用会产生无意义失败调用）。是否同意？
-- **D2 · 依赖安装方式**：
-  - (a) 软依赖（推荐，沿用旧设计）：不写进 requirements.txt，Docker 镜像不装；用户在文档/UI 提示下自行 `pip install tushare`。镜像体积不增。
-  - (b) 必装：写进 requirements.txt + Dockerfile，开箱可用但镜像变大（tushare 依赖 pandas 等）。
+- **D2 · 依赖安装方式**：原定软依赖；**2026-07-27 已由所有者改决策为必装**：写进 `requirements.txt`，随 Docker 镜像安装。Tushare token 仍不进仓库/镜像，继续由数据源配置或 `TUSHARE_TOKEN` 提供。
 - **D3 · 回归范围**：建议仅恢复 K 线（与旧行为一致）。Tushare 还有基本面/资金流/龙虎榜等接口，本次不扩展。是否同意？
 - **D4 · 同步上游**：本改动是 fork 私有，还是整理成 PR 提回上游 TNT-Likely/PanWatch？（影响分支与提交粒度安排）
 - **D5 · data_sources config 凭证掩码（多租户新增）**：建议随本次回归一并修——`GET /api/datasources`
@@ -96,5 +94,9 @@
   provider；`tests/test_datasource_config_mask.py` 新增 4 例（D5）
 - 测试结果：主套件 **828 passed** + marketdata 包 **215 passed**，零失败
 - 实测：服务重启后种子已落库（Tushare K线, priority=10, enabled=False）；
-  **真实取数未验证**——venv 未装 tushare（D2 软依赖），需 `pip install tushare` + 配置 token
-  后在数据源页手动测 600519
+  **真实取数未验证**——需在 R1 发布后配置 token，再在 NAS 数据源页手动测 600519 与 688110。
+
+## R1 依赖修复（2026-07-27，施工中）
+
+- `requirements.txt` 加入 `tushare>=1.4.29,<2`，Dockerfile 已经统一执行该文件，无须增加额外安装层。
+- vendor 保持惰性导入，以便独立使用 marketdata 包时仍可优雅降级；应用主套件新增运行时依赖断言，防止镜像再次遗漏该包。

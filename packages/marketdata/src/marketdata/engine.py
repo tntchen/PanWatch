@@ -51,6 +51,15 @@ class Engine:
                 continue
             if vendor.supports_markets and market not in vendor.supports_markets:
                 continue
+            should_attempt = getattr(self.metrics, "should_attempt", None)
+            if callable(should_attempt) and not should_attempt(
+                vendor=src.vendor, datatype=self.datatype, market=market
+            ):
+                logger.warning(
+                    "[marketdata/%s] vendor=%s 熔断中，跳过并尝试备源",
+                    self.datatype, src.vendor,
+                )
+                continue
 
             t0 = time.monotonic()
             try:

@@ -384,6 +384,13 @@ class MarketData:
         """每个 vendor 的内存健康度快照(成功率 / p50 延迟 / 最近错误)。"""
         return self.metrics.snapshot()
 
+    def health_for(self, datatype: str, vendor: str, market: str | None = None) -> dict | None:
+        """精确数据源健康度；旧 MetricsSink 不支持时优雅回退到 provider 汇总。"""
+        method = getattr(self.metrics, "health_for", None)
+        if callable(method):
+            return method(vendor=vendor, datatype=datatype, market=market)
+        return self.health().get(vendor)
+
     def hot_stocks(self, **kw) -> list[HotStock]:
         """热门/异动股(东财榜单,市场级、不经 Engine)。"""
         return self._discovery.hot_stocks(**kw)

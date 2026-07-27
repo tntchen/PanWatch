@@ -1,7 +1,8 @@
-"""Tushare K 线 vendor(可选,仅 A 股日线,需用户配 token)。
+"""Tushare K 线 vendor（仅 A 股日线，需用户配 token）。
 
-软依赖(对齐 D2 决策,不写进 requirements):
-- 未安装 `tushare` 包 → 记日志返回 [],由 Engine 落到下一优先级源
+应用镜像会通过 requirements.txt 安装 tushare。保留惰性导入，使 marketdata
+作为独立包使用时仍能优雅降级：
+- 非标准独立环境未安装 `tushare` 包 → 记日志返回 [],由 Engine 落到下一优先级源
 - token 取 config["token"] → 环境变量 TUSHARE_TOKEN 兜底;缺失同样返回 []
 - `tushare` 包在 fetch 内惰性 import,模块级导入本文件不引入重依赖
 """

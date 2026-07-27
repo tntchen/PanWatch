@@ -302,7 +302,14 @@ export default function DataSourcesPage() {
                             成功率 {Math.round(source.health.success_rate * 100)}%
                             {source.health.p50_latency_ms != null && ` · p50 ${source.health.p50_latency_ms}ms`}
                             {source.health.last_error ? ` · 最近错误` : ''}
+                            {source.health.circuit_open ? ' · 已熔断，正使用备源' : ''}
                           </span>
+                        )}
+                        {source.engine_attached && source.health?.circuit_open && (
+                          <Badge variant="destructive" className="text-[10px] px-1.5 py-0.5">
+                            <AlertTriangle className="w-2.5 h-2.5" />
+                            熔断中
+                          </Badge>
                         )}
                       </div>
                     </div>

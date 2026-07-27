@@ -196,12 +196,19 @@ class BasePlaybookBriefAgent(BaseAgent):
         playbook_summary = getattr(context, "_playbook_summary", None) or symbol_ctx.get(
             "playbook"
         )
+        pack = packs.get(stock.symbol)
+        quote = getattr(pack, "quote", None) if pack else None
+        # R2：早/尾盘都是交易型简报。没有可执行的实时价格时，允许留痕分析，
+        # 但绝不能把 LLM 的文字当作可交易建议推送出去。
+        data_ready = bool(quote and getattr(quote, "current_price", None) is not None)
         return {
             "stock": stock,
-            "pack": packs.get(stock.symbol),
+            "pack": pack,
             "symbol_ctx": symbol_ctx,
             "playbook_summary": playbook_summary,
             "timestamp": datetime.now().isoformat(),
+            "data_ready": data_ready,
+            "data_quality_reason": "ok" if data_ready else "missing_realtime_quote",
         }
 
     def build_prompt(self, data: dict, context: AgentContext) -> tuple[str, str]:
@@ -324,6 +331,9 @@ class BasePlaybookBriefAgent(BaseAgent):
                 "contract_valid": valid,
                 "contract_reason": reason,
                 "action_label": action_label,
+                # 兼容自定义/旧测试 collect：只有显式 False 才判关键数据不可用。
+                "data_ready": data.get("data_ready") is not False,
+                "data_quality_reason": data.get("data_quality_reason", "unknown"),
                 "prompt_context": user_content[:8000],
             },
         )
@@ -345,7 +355,15 @@ class BasePlaybookBriefAgent(BaseAgent):
         return result
 
     async def should_notify(self, result: AnalysisResult) -> bool:
-        """契约校验不过则不推送（已落日志）。"""
+        """契约或关键实时行情缺失时均不推送交易型简报。"""
+        if result.raw_data.get("data_ready") is False:
+            logger.error(
+                "[%s] 关键行情不可用(%s)，抑制交易型简报推送",
+                self.name,
+                result.raw_data.get("data_quality_reason", "unknown"),
+            )
+            result.raw_data["notify_skipped"] = "data_unavailable"
+            return False
         return bool(result.raw_data.get("contract_valid"))
 
 

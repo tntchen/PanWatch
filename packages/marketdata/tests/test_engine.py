@@ -135,3 +135,30 @@ def test_engine_passes_request_extra_to_vendor_config():
     e.fetch(Request(symbols=("x",), market="CN", limit=99, extra=(("since_days", 30),)))
     assert seen["since_days"] == 30
     assert seen["days"] == 99  # extra 透传不应破坏原有 days 注入
+
+
+def test_circuit_breaker_skips_failed_primary_and_uses_backup():
+    primary = FakeVendor("a", "raise")
+    backup = FakeVendor("b", "ok")
+    e = _engine(
+        {"a": primary, "b": backup},
+        [SourceConfig(vendor="a", priority=1), SourceConfig(vendor="b", priority=2)],
+    )
+    # 连续三次异常后主源熔断；第四次不再调用主源但仍会切备源。
+    calls = {"a": 0}
+    original = primary.fetch
+    def counted(*args):
+        calls["a"] += 1
+        return original(*args)
+    primary.fetch = counted
+    for _ in range(4):
+        assert e.fetch(_req(), cache_ttl_sec=0).vendor == "b"
+    assert calls["a"] == 3
+
+
+def test_empty_result_does_not_open_circuit():
+    primary = FakeVendor("a", "empty")
+    e = _engine({"a": primary}, [SourceConfig(vendor="a", priority=1)])
+    for _ in range(4):
+        assert e.fetch(_req(), cache_ttl_sec=0).ok is False
+    assert e.metrics.health_for(vendor="a", datatype="quote", market="CN")["circuit_open"] is False
