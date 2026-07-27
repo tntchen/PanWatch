@@ -176,3 +176,20 @@ NAS 侧操作（通过 SSH jonah@192.168.1.124，sudo 执行，部署时进行�
 3. **群晖架构**：新款群晖多为 x86_64（amd64 镜像），部分 ARM 机型用 arm64——阶段 2 第一步确认。
 4. **SQLite 单容器**：不做高可用；数据即卷，备份即备份卷。
 5. **端口约定**：容器内 8000 不可改，宿主机映射可调。
+
+### 追加：NAS 响应慢排查与 0.4.2 修复（2026-07-27）
+
+**症状**：NAS 部署后所有 API 响应极慢，连空的 `/api/health` 也要 ~28 秒。
+
+**三重根因（逐一确诊）**：
+
+1. **NAS 的 IP 被东方财富接口秒拒（TCP RST）**，Mac 正常、走代理也不稳。处置：在 NAS DB `data_sources` 表禁用全部 12 个含"东财"的数据源（enabled=0，保持禁用勿重启用），腾讯/新浪/同花顺/Tushare/财联社源正常。
+2. **新浪汇率端点 NAS 直连间歇 5 秒超时**。处置：建 SSH 隧道把 Mac 上 Clash(mihomo) 的 7897 代理暴露给 NAS——NAS 上 `nohup ssh -N -L 192.168.1.124:7897:127.0.0.1:7897 jonah@192.168.1.212`（NAS 公钥已加 Mac authorized_keys，隧道日志 `/tmp/proxy_tunnel.log`），NAS `.env` 增加 `HTTP_PROXY/HTTPS_PROXY=http://192.168.1.124:7897`、`NO_PROXY=localhost,127.0.0.1`。**注意：隧道 NAS 重启后会丢，需重建**（后续可考虑做成群晖计划任务自启动）。
+3. **真正的卡死根因**：`src/web/log_handler.py` 的 DBLogHandler 在 `emit()` 持 `self._lock` 期间内联 flush 写 SQLite；Timer 线程 flush 因 SQLite 写锁（busy_timeout 30s）阻塞时，事件循环线程上任何一条日志 emit 都卡在锁上 → 整个事件循环冻结 ~28 秒。
+
+**修复（0.4.2，已部署验证）**：DBLogHandler 改为 emit 只追加内存缓冲，flush 统一由 Timer 线程在锁外执行（新公开方法 `flush_entries()`，删除 `_flush_unlocked` 与 `BUFFER_SIZE` 常量）；`tests/test_mt_p3_agent_context_tenant.py:188` 同步改为 `handler.flush_entries()`。本地 828 测试全过 → commit 推送 → CI run 30268662601 success → NAS compose up -d 升级 0.4.2 healthy。**`/api/health` 从 ~28s 降到 2-13ms（6 次复测）**。
+
+**遗留事项**：
+
+- SQLite 写锁竞争仍在后台存在：PaperTradingScheduler / PriceAlertScheduler 每 60 秒扫描，引擎"写库后未 commit、继续网络抓取"的模式长持写锁（`src/core/paper_trading_engine.py:592`），采样写锁可用率约 50%，日志偶发 `database is locked`（下一分钟自愈）。不影响 API 响应速度，但引擎 commit 粒度重构（fetch-then-write）建议列为下一阶段任务，走阶段门禁批准后再动。
+- SSH 隧道无自启动，NAS 重启后需手工重建（见上）。
