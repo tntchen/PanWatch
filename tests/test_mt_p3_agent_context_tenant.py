@@ -184,8 +184,7 @@ def test_log_handler_captures_tenant_at_emit(mem_db, monkeypatch):
                 "test", logging.INFO, __file__, 1, "scoped", (), None
             )
             handler.emit(rec2)
-        with handler._lock:
-            handler._flush_unlocked()
+        handler.flush_entries()
         db = mem_db()
         try:
             rows = db.query(LogEntry).order_by(LogEntry.id).all()

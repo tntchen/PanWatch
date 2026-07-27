@@ -19,7 +19,6 @@ from src.web.tenant_context import current_tenant
 MAX_LOG_ENTRIES_TOTAL = 120_000
 MAX_INFRA_LOG_ENTRIES = 30_000
 MAX_BUFFERED_ENTRIES = 2_000
-BUFFER_SIZE = 80
 FLUSH_INTERVAL = 1.0  # seconds
 CLEANUP_EVERY_FLUSHES = 10
 INFRA_LOGGER_PREFIXES = (
@@ -92,6 +91,15 @@ class DBLogHandler(logging.Handler):
         self._start_flush_timer()
 
     def emit(self, record: logging.LogRecord):
+        """只做内存缓冲，绝不在持锁状态做 DB I/O。
+
+        教训（2026-07-27 NAS 卡顿事故）：旧实现里 buffer 满或 ERROR 级会在
+        emit 内联 flush，且 flush 全程持 _lock；一旦 Timer 线程的 flush 因
+        SQLite 写锁等待（busy_timeout 30s）阻塞，事件循环线程上的任何一条
+        日志 emit 都会卡在 _lock 上——整个事件循环被冻结 ~30s，连最轻的
+        /api/health 都要排队。现改为：emit 只追加缓冲（O(1)），DB 写统一由
+        Timer 线程在锁外执行；Timer 线程阻塞无害。
+        """
         try:
             tags = getattr(record, "tags", {})
             if not isinstance(tags, dict):
@@ -118,8 +126,6 @@ class DBLogHandler(logging.Handler):
                         del self._buffer[:overflow]
                         self._dropped_entries += overflow
                 self._buffer.append(entry)
-                if record.levelno >= logging.ERROR or len(self._buffer) >= BUFFER_SIZE:
-                    self._flush_unlocked()
         except Exception:
             # Avoid recursion if logging path fails
             pass
@@ -130,15 +136,18 @@ class DBLogHandler(logging.Handler):
         self._timer.start()
 
     def _timed_flush(self):
-        with self._lock:
-            self._flush_unlocked()
-        self._start_flush_timer()
+        try:
+            self.flush_entries()
+        finally:
+            self._start_flush_timer()
 
-    def _flush_unlocked(self):
-        if not self._buffer:
-            return
-        entries = self._buffer[:]
-        self._buffer.clear()
+    def flush_entries(self):
+        """取出缓冲并在**锁外**写库（唯一 DB 写入口，Timer 线程调用）。"""
+        with self._lock:
+            if not self._buffer:
+                return
+            entries = self._buffer[:]
+            self._buffer.clear()
 
         try:
             db = SessionLocal()
@@ -154,6 +163,7 @@ class DBLogHandler(logging.Handler):
         except Exception as e:
             self._flush_errors += 1
             self._last_flush_error = str(e)[:500]
+            # 失败条目丢弃（缓冲有上限保护，日志链路 fail-soft，不背压调用方）
 
     def _cleanup(self, db):
         """Retention policy: prioritize preserving business logs."""
@@ -195,6 +205,5 @@ class DBLogHandler(logging.Handler):
     def close(self):
         if self._timer:
             self._timer.cancel()
-        with self._lock:
-            self._flush_unlocked()
+        self.flush_entries()
         super().close()
