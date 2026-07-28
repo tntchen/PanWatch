@@ -1958,12 +1958,19 @@ if os.path.exists(static_dir):
     from fastapi.responses import FileResponse
 
     # SPA 路由：所有非 API 请求返回 index.html
+    # 安全（2026-07-29 审计 P0）：path 必须经 realpath 归一化并校验仍在
+    # static_dir 内——此前 os.path.join + isfile 直接放行，
+    # `GET /../data/panwatch.db`（curl --path-as-is 不过 uvicorn/浏览器）
+    # 可未授权下载整个数据库（含 AI keys / jwt_secret / 密码哈希）。
+    _static_root = os.path.realpath(static_dir)
+
     @app.get("/{path:path}")
     async def serve_spa(path: str):
-        file_path = os.path.join(static_dir, path)
-        if os.path.isfile(file_path):
-            return FileResponse(file_path)
-        return FileResponse(os.path.join(static_dir, "index.html"))
+        candidate = os.path.realpath(os.path.join(_static_root, path))
+        # 越出静态目录（含 ".." 穿越/符号链接逃逸）一律回退 index.html
+        if candidate.startswith(_static_root + os.sep) and os.path.isfile(candidate):
+            return FileResponse(candidate)
+        return FileResponse(os.path.join(_static_root, "index.html"))
 
     logger.info(f"静态文件服务已启用: {static_dir}")
 
