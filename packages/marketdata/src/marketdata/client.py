@@ -6,8 +6,14 @@ import time
 from datetime import datetime, timedelta
 
 from marketdata.cache import TTLCache
-from marketdata.defaults import InMemoryMetricsSink
+from marketdata.defaults import (
+    ERROR_CLASS_CONFIG,
+    ERROR_CLASS_EMPTY,
+    ERROR_CLASS_TRANSPORT,
+    InMemoryMetricsSink,
+)
 from marketdata.engine import Engine
+from marketdata.errors import ConfigError
 from marketdata.http import record_error
 from marketdata.ports import ConfigProvider, MetricsSink
 from marketdata.registry import build_vendors
@@ -247,8 +253,10 @@ class MarketData:
                 articles = vendor.fetch(syms, call_config) or []
             except Exception as e:
                 latency = int((time.monotonic() - t0) * 1000)
+                error_class = ERROR_CLASS_CONFIG if isinstance(e, ConfigError) else ERROR_CLASS_TRANSPORT
                 self.metrics.record(vendor=src.vendor, datatype="news", market=market,
-                                    ok=False, count=0, latency_ms=latency, error=str(e))
+                                    ok=False, count=0, latency_ms=latency, error=str(e),
+                                    error_class=error_class)
                 record_error(f"{src.vendor}: {type(e).__name__}: {e}")
                 continue
 
@@ -258,7 +266,8 @@ class MarketData:
                                     ok=True, count=len(articles), latency_ms=latency)
             else:
                 self.metrics.record(vendor=src.vendor, datatype="news", market=market,
-                                    ok=False, count=0, latency_ms=latency, error="empty")
+                                    ok=False, count=0, latency_ms=latency,
+                                    error=ERROR_CLASS_EMPTY, error_class=ERROR_CLASS_EMPTY)
             all_articles.extend(articles)
 
         seen: set[str] = set()

@@ -1,9 +1,13 @@
 """Tushare K 线 vendor（仅 A 股日线，需用户配 token）。
 
 应用镜像会通过 requirements.txt 安装 tushare。保留惰性导入，使 marketdata
-作为独立包使用时仍能优雅降级：
-- 非标准独立环境未安装 `tushare` 包 → 记日志返回 [],由 Engine 落到下一优先级源
-- token 取 config["token"] → 环境变量 TUSHARE_TOKEN 兜底;缺失同样返回 []
+作为独立包使用时仍能优雅降级。错误语义（R2 错误分类）：
+- 未安装 `tushare` 包 / token 缺失 → 抛 ConfigError（配置异常，Engine 单列、
+  不触发熔断），由 Engine 落到下一优先级源
+- `pro.daily` 调用异常（网络/限流/服务）→ 原样上抛给 Engine 归类为传输异常，
+  计入熔断连续失败（此前内部吞掉返回 []，会被误记为 "empty"，既丢分类又
+  让该源永远无法熔断）
+- token 取 config["token"] → 环境变量 TUSHARE_TOKEN 兜底
 - `tushare` 包在 fetch 内惰性 import,模块级导入本文件不引入重依赖
 """
 
@@ -13,7 +17,7 @@ import logging
 import os
 from datetime import datetime, timedelta
 
-from marketdata.http import record_error
+from marketdata.errors import ConfigError
 from marketdata.symbol import Market, Symbol, _cn_exchange
 from marketdata.types import Bar
 from marketdata.vendors.base import KlineVendor
@@ -47,17 +51,15 @@ class TushareKlineVendor(KlineVendor):
         try:
             import tushare as ts
         except ImportError:
-            msg = "tushare: 未安装 tushare 包,执行 `pip install tushare` 后启用"
-            logger.warning(msg)
-            record_error(msg)
-            return []
+            raise ConfigError(
+                "tushare: 未安装 tushare 包,执行 `pip install tushare` 后启用"
+            )
 
         token = (config or {}).get("token") or os.environ.get("TUSHARE_TOKEN", "")
         if not token:
-            msg = "tushare: token 未配置(DataSource.config.token 或环境变量 TUSHARE_TOKEN)"
-            logger.warning(msg)
-            record_error(msg)
-            return []
+            raise ConfigError(
+                "tushare: token 未配置(DataSource.config.token 或环境变量 TUSHARE_TOKEN)"
+            )
 
         days = _days(config)
         ts_code = _ts_code(sym)
@@ -65,15 +67,10 @@ class TushareKlineVendor(KlineVendor):
         end_date = datetime.now().strftime("%Y%m%d")
         start_date = (datetime.now() - timedelta(days=days * 2)).strftime("%Y%m%d")
 
-        try:
-            ts.set_token(token)
-            pro = ts.pro_api()
-            df = pro.daily(ts_code=ts_code, start_date=start_date, end_date=end_date)
-        except Exception as e:
-            msg = f"tushare: daily 调用失败({ts_code}): {type(e).__name__}: {e}"
-            logger.warning(msg)
-            record_error(msg)
-            return []
+        # 传输/服务异常不在此吞掉：上抛给 Engine 归类 transport 并计入熔断。
+        ts.set_token(token)
+        pro = ts.pro_api()
+        df = pro.daily(ts_code=ts_code, start_date=start_date, end_date=end_date)
 
         if df is None or len(df) == 0:
             return []

@@ -11,6 +11,8 @@ import logging
 import time
 
 from marketdata.cache import TTLCache
+from marketdata.defaults import ERROR_CLASS_CONFIG, ERROR_CLASS_EMPTY, ERROR_CLASS_TRANSPORT
+from marketdata.errors import ConfigError
 from marketdata.http import record_error
 from marketdata.ports import ConfigProvider, MetricsSink
 from marketdata.symbol import Market, Symbol
@@ -67,8 +69,11 @@ class Engine:
                 data = vendor.fetch(syms, call_config)
             except Exception as e:
                 latency = int((time.monotonic() - t0) * 1000)
+                # R2 错误分类：配置异常(token/鉴权/依赖)单列,不与传输异常混淆。
+                error_class = ERROR_CLASS_CONFIG if isinstance(e, ConfigError) else ERROR_CLASS_TRANSPORT
                 self.metrics.record(vendor=src.vendor, datatype=self.datatype, market=market,
-                                    ok=False, count=0, latency_ms=latency, error=str(e))
+                                    ok=False, count=0, latency_ms=latency, error=str(e),
+                                    error_class=error_class)
                 last_err = str(e)
                 logger.warning(f"[marketdata/{self.datatype}] vendor={src.vendor} raised: {e}")
                 record_error(f"{src.vendor}: {type(e).__name__}: {e}")
@@ -88,7 +93,8 @@ class Engine:
                     best = resp
             else:
                 self.metrics.record(vendor=src.vendor, datatype=self.datatype, market=market,
-                                    ok=False, count=0, latency_ms=latency, error="empty")
+                                    ok=False, count=0, latency_ms=latency,
+                                    error=ERROR_CLASS_EMPTY, error_class=ERROR_CLASS_EMPTY)
                 last_err = "empty"
 
         if best is not None:

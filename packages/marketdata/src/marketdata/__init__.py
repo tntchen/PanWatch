@@ -2,7 +2,7 @@
 
 from marketdata.client import MarketData
 from marketdata.defaults import InMemoryMetricsSink, StaticConfigProvider
-from marketdata.errors import MarketDataError, VendorError
+from marketdata.errors import ConfigError, MarketDataError, VendorError
 from marketdata.http import capture_errors, record_error
 from marketdata.ports import ConfigProvider, MetricsSink, SourceConfig
 from marketdata.registry import PACKAGE_VENDORS_BY_TYPE
@@ -37,5 +37,5 @@ __all__ = [
     "StaticConfigProvider", "InMemoryMetricsSink",
     "PACKAGE_VENDORS_BY_TYPE",
     "capture_errors", "record_error",
-    "MarketDataError", "VendorError", "__version__",
+    "MarketDataError", "VendorError", "ConfigError", "__version__",
 ]

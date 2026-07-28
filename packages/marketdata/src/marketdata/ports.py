@@ -27,5 +27,8 @@ class ConfigProvider(Protocol):
 @runtime_checkable
 class MetricsSink(Protocol):
     def record(self, *, vendor: str, datatype: str, market: str | None,
-               ok: bool, count: int, latency_ms: int, error: str = "") -> None:
+               ok: bool, count: int, latency_ms: int, error: str = "",
+               error_class: str = "") -> None:
+        """error_class 取值:""(未分类)/"empty"(空数据)/"config"(配置异常)/
+        "transport"(传输/服务异常)。旧实现可忽略该参数。"""
         ...

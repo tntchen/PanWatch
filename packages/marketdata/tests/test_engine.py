@@ -162,3 +162,78 @@ def test_empty_result_does_not_open_circuit():
     for _ in range(4):
         assert e.fetch(_req(), cache_ttl_sec=0).ok is False
     assert e.metrics.health_for(vendor="a", datatype="quote", market="CN")["circuit_open"] is False
+
+
+# ---------------------------------------------------------------------------
+# R2 偏差修复回归（2026-07-29）：熔断阈值可配置 + 错误分类
+# ---------------------------------------------------------------------------
+
+
+def test_config_error_does_not_open_circuit_and_is_classified():
+    """配置异常(ConfigError)单列：不计入熔断计数,快照带 error_class=config。"""
+    from marketdata.errors import ConfigError
+
+    class CfgVendor:
+        name = "a"
+        supports_markets: set = set()
+
+        def fetch(self, symbols, config):
+            raise ConfigError("token 未配置")
+
+    m = InMemoryMetricsSink()
+    e = _engine({"a": CfgVendor()}, [SourceConfig(vendor="a", priority=1)], metrics=m)
+    for _ in range(4):
+        assert e.fetch(_req(), cache_ttl_sec=0).ok is False
+    h = m.health_for(vendor="a", datatype="quote", market="CN")
+    assert h["circuit_open"] is False
+    assert h["consecutive_failures"] == 0
+    assert h["consecutive_config_failures"] == 4
+    assert h["last_error_class"] == "config"
+
+
+def test_transport_error_classified_and_trips_circuit():
+    """普通异常归类 transport,计入熔断。"""
+    m = InMemoryMetricsSink()
+    e = _engine({"a": FakeVendor("a", "raise")}, [SourceConfig(vendor="a", priority=1)], metrics=m)
+    for _ in range(3):
+        e.fetch(_req(), cache_ttl_sec=0)
+    h = m.health_for(vendor="a", datatype="quote", market="CN")
+    assert h["circuit_open"] is True
+    assert h["last_error_class"] == "transport"
+
+
+def test_circuit_threshold_configurable_via_constructor():
+    """阈值/时长可配置:threshold=1 时一次失败即熔断。"""
+    primary = FakeVendor("a", "raise")
+    backup = FakeVendor("b", "ok")
+    m = InMemoryMetricsSink(circuit_failure_threshold=1, circuit_cooldown_sec=60.0)
+    e = _engine(
+        {"a": primary, "b": backup},
+        [SourceConfig(vendor="a", priority=1), SourceConfig(vendor="b", priority=2)],
+        metrics=m,
+    )
+    calls = {"a": 0}
+    original = primary.fetch
+    primary.fetch = lambda *args: (calls.__setitem__("a", calls["a"] + 1), original(*args))[1]
+    for _ in range(3):
+        assert e.fetch(_req(), cache_ttl_sec=0).vendor == "b"
+    assert calls["a"] == 1  # 一次失败即熔断,之后不再调用主源
+    h = m.health_for(vendor="a", datatype="quote", market="CN")
+    assert h["circuit_open"] is True
+    # 冷却时长 ≈ 60s（record 内 last_attempt_at 与 circuit_open_until 两个
+    # time.time() 调用点有微秒级间隔，给 1s 容差）
+    assert 59.0 < h["circuit_open_until"] - h["last_attempt_at"] <= 61.0
+
+
+def test_circuit_threshold_configurable_via_env(monkeypatch):
+    """未显式传参时读环境变量;显式参数优先于环境变量。"""
+    monkeypatch.setenv("MARKETDATA_CIRCUIT_FAILURE_THRESHOLD", "5")
+    monkeypatch.setenv("MARKETDATA_CIRCUIT_COOLDOWN_SEC", "120")
+    m = InMemoryMetricsSink()
+    assert m._failure_threshold == 5
+    assert m._cooldown_sec == 120.0
+    m2 = InMemoryMetricsSink(circuit_failure_threshold=2)
+    assert m2._failure_threshold == 2  # 显式参数优先
+    # 非法环境变量回落默认
+    monkeypatch.setenv("MARKETDATA_CIRCUIT_FAILURE_THRESHOLD", "not-a-number")
+    assert InMemoryMetricsSink()._failure_threshold == 3

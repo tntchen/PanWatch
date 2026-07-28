@@ -1,6 +1,7 @@
 """Tushare K 线 vendor 单测:mock pro_api,不打真实网络。
 
-覆盖:① 未装包 ② 无 token ③ 正常返回映射 Bar 字段 ④ 空数据 ⑤ env token 兜底。
+覆盖:① 未装包→ConfigError ② 无 token→ConfigError ③ 正常返回映射 Bar 字段
+④ 空数据 ⑤ env token 兜底 ⑥ daily 异常原样上抛(Engine 归类 transport)。
 """
 
 import sys
@@ -10,6 +11,7 @@ import pandas as pd
 import pytest
 
 import marketdata.vendors.tushare as tv
+from marketdata.errors import ConfigError
 from marketdata.symbol import Symbol
 
 
@@ -45,17 +47,17 @@ def _clean_env(monkeypatch):
     monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
 
 
-def test_tushare_missing_lib_returns_empty(monkeypatch):
+def test_tushare_missing_lib_raises_config_error(monkeypatch):
     monkeypatch.setitem(sys.modules, "tushare", None)  # import 触发 ImportError
-    out = tv.TushareKlineVendor().fetch([Symbol.parse("600519")], {"token": "x", "days": 30})
-    assert out == []
+    with pytest.raises(ConfigError, match="未安装"):
+        tv.TushareKlineVendor().fetch([Symbol.parse("600519")], {"token": "x", "days": 30})
 
 
-def test_tushare_missing_token_returns_empty(monkeypatch):
+def test_tushare_missing_token_raises_config_error(monkeypatch):
     df = _daily_df([("20260702", 1500.0, 1520.0, 1490.0, 1510.0, 100.0, 15000.0)])
     monkeypatch.setitem(sys.modules, "tushare", _fake_tushare_module(df))
-    out = tv.TushareKlineVendor().fetch([Symbol.parse("600519")], {"days": 30})
-    assert out == []
+    with pytest.raises(ConfigError, match="token 未配置"):
+        tv.TushareKlineVendor().fetch([Symbol.parse("600519")], {"days": 30})
 
 
 def test_tushare_parses_bars(monkeypatch):
@@ -136,7 +138,8 @@ def test_tushare_config_token_beats_env(monkeypatch):
     assert fake._calls["token"] == "cfg_tok"
 
 
-def test_tushare_daily_raises_returns_empty(monkeypatch):
+def test_tushare_daily_raises_propagates(monkeypatch):
+    """daily 传输/服务异常不再被吞成 []：原样上抛，由 Engine 归类 transport。"""
     fake = types.ModuleType("tushare")
 
     class _Pro:
@@ -146,8 +149,8 @@ def test_tushare_daily_raises_returns_empty(monkeypatch):
     fake.set_token = lambda token: None
     fake.pro_api = lambda: _Pro()
     monkeypatch.setitem(sys.modules, "tushare", fake)
-    out = tv.TushareKlineVendor().fetch([Symbol.parse("600519")], {"token": "t", "days": 30})
-    assert out == []
+    with pytest.raises(RuntimeError, match="rate limited"):
+        tv.TushareKlineVendor().fetch([Symbol.parse("600519")], {"token": "t", "days": 30})
 
 
 def test_tushare_no_symbols_returns_empty():
