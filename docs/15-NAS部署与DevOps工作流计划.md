@@ -193,3 +193,18 @@ NAS 侧操作（通过 SSH jonah@192.168.1.124，sudo 执行，部署时进行�
 
 - SQLite 写锁竞争仍在后台存在：PaperTradingScheduler / PriceAlertScheduler 每 60 秒扫描，引擎"写库后未 commit、继续网络抓取"的模式长持写锁（`src/core/paper_trading_engine.py:592`），采样写锁可用率约 50%，日志偶发 `database is locked`（下一分钟自愈）。不影响 API 响应速度，但引擎 commit 粒度重构（fetch-then-write）建议列为下一阶段任务，走阶段门禁批准后再动。
 - SSH 隧道无自启动，NAS 重启后需手工重建（见上）。
+
+### 追加：引擎 commit 粒度重构（0.4.3，2026-07-27，已批准）
+
+**变更清单**：
+
+1. `src/core/paper_trading_engine.py`
+   - `_check_exits`：信号反转判断与信号 holding_days 由"循环内逐持仓查询"改为循环前两次批量预取（`latest_signal_actions` / `signal_hold_days` 两个字典），循环体零 DB 查询，不再触发中途 autoflush 抢写锁；原 `db.no_autoflush` 包裹的单点查询随之删除。
+   - `_update_account_metrics`：新增可选参数 `open_positions`，扫描路径直接复用内存持仓状态，消除 commit 前最后一次触发 autoflush 的查询；手动平仓路径不传参、行为不变。
+2. `src/core/price_alert_engine.py`
+   - `scan_once` 触达路径：命中记录 flush（防重）+ 规则状态更新 → **先 commit 立即释放写锁** → 网络通知发送（移出写事务）→ 小事务回写通知结果。此前写锁跨越整个通知网络调用持有，是并发扫描时 `database is locked` 的主要长持锁源。
+3. 测试：本地 828 项全过；commit `b9fc413`。
+
+**东财源重启测试结论（2026-07-27）**：**仍被封，保持禁用**。从 NAS 实测：clist/ulist 行情接口偶发放行（77ms 正常返回），但连续请求即被 RST（000/80ms 秒拒），push2his K线接口稳定被拒；经代理（Clash 节点）同样 502/断连。属于针对 NAS 出口 IP 的限流式封锁，重新启用会引入间歇性超时，12 个东财源维持 `enabled=0`。
+
+**遗留**：SSH 代理隧道（NAS 7897 → Mac Clash）仍无自启动，NAS 重启后需重建。
